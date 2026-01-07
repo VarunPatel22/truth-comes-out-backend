@@ -87,28 +87,34 @@ io.on("connection", socket => {
   });
 
   // START ROUND
-  async function startRound(roomCode) {
-    const room = rooms[roomCode];
-    room.answers = [];
+ async function startRound(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
 
-    const snap = await db.collection("questions").get();
-    const questions = snap.docs.map(d => d.data());
-    const q = questions[Math.floor(Math.random() * questions.length)];
+  room.answers = [];
 
-    const players = Object.values(room.players); // array of names
-    const randomName =
-     players[Math.floor(Math.random() * players.length)];
+  const snap = await db.collection("questions").get();
+  const questions = snap.docs.map(d => d.data());
+  if (questions.length === 0) return;
 
-     let questionText = question.text;
+  const q = questions[Math.floor(Math.random() * questions.length)];
 
-// 🔥 REPLACE {{name}} HERE (BACKEND ONLY)
-     questionText = questionText.replace(/\{\{name\}\}/gi, randomName);
+  const players = Object.values(room.players);
+  const randomName =
+    players[Math.floor(Math.random() * players.length)];
 
-     io.to(roomCode).emit("new-question", {
-     text: questionText
-});
+  let questionText = q.text;
 
-  }
+  // 🔥 Replace {{name}} with random player name
+  questionText = questionText.replace(/\{\{name\}\}/gi, randomName);
+
+  io.to(roomCode).emit("new-question", {
+    text: questionText
+  });
+}
+
+
+
 
   // SUBMIT ANSWER
   socket.on("submit-answer", ({ roomCode, answer }) => {
