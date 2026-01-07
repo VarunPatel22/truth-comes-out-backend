@@ -9,9 +9,7 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" }
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
 // 🔐 Firebase
 admin.initializeApp({
@@ -25,12 +23,10 @@ const db = admin.firestore();
 // ---------------- GAME STATE ----------------
 const rooms = {};
 
-// Utility
 function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-// ---------------- SOCKET LOGIC ----------------
 io.on("connection", socket => {
 
   // CREATE ROOM
@@ -42,6 +38,7 @@ io.on("connection", socket => {
       players: {},
       scores: {},
       answers: [],
+      votes: {},
       round: 0,
       maxRounds: 10,
       gameStarted: false
@@ -51,8 +48,10 @@ io.on("connection", socket => {
     rooms[roomCode].scores[socket.id] = 0;
 
     socket.join(roomCode);
-
-    socket.emit("room-created", { roomCode, players: Object.values(rooms[roomCode].players) });
+    socket.emit("room-created", {
+      roomCode,
+      players: Object.values(rooms[roomCode].players)
+    });
   });
 
   // JOIN ROOM
@@ -64,11 +63,10 @@ io.on("connection", socket => {
     room.scores[socket.id] = 0;
 
     socket.join(roomCode);
-
     io.to(roomCode).emit("player-update", Object.values(room.players));
   });
 
-  // SET ROUNDS (HOST ONLY)
+  // SET ROUNDS
   socket.on("set-rounds", ({ roomCode, rounds }) => {
     if (rooms[roomCode]?.host === socket.id) {
       rooms[roomCode].maxRounds = rounds;
@@ -76,50 +74,42 @@ io.on("connection", socket => {
   });
 
   // START GAME
-  socket.on("start-game", async roomCode => {
+  socket.on("start-game", roomCode => {
     const room = rooms[roomCode];
     if (!room || room.host !== socket.id) return;
 
-    room.gameStarted = true;
     room.round = 0;
-
     startRound(roomCode);
   });
 
   // START ROUND
- async function startRound(roomCode) {
-  const room = rooms[roomCode];
-  if (!room) return;
+  async function startRound(roomCode) {
+    const room = rooms[roomCode];
+    if (!room) return;
 
-  room.answers = [];
+    room.answers = [];
+    room.votes = {};
 
-  const snap = await db.collection("questions").get();
-  const questions = snap.docs.map(d => d.data());
-  if (questions.length === 0) return;
+    const snap = await db.collection("questions").get();
+    const questions = snap.docs.map(d => d.data());
+    const q = questions[Math.floor(Math.random() * questions.length)];
 
-  const q = questions[Math.floor(Math.random() * questions.length)];
+    const players = Object.values(room.players);
+    const randomName = players[Math.floor(Math.random() * players.length)];
 
-  const players = Object.values(room.players);
-  const randomName =
-    players[Math.floor(Math.random() * players.length)];
+    const questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
 
-  let questionText = q.text;
-
-  // 🔥 Replace {{name}} with random player name
-  questionText = questionText.replace(/\{\{name\}\}/gi, randomName);
-
-  io.to(roomCode).emit("new-question", {
-    text: questionText
-  });
-}
-
-
-
+    io.to(roomCode).emit("new-question", {
+      text: questionText
+    });
+  }
 
   // SUBMIT ANSWER
   socket.on("submit-answer", ({ roomCode, answer }) => {
     const room = rooms[roomCode];
     if (!room) return;
+
+    if (room.answers.find(a => a.author === socket.id)) return;
 
     room.answers.push({
       author: socket.id,
@@ -136,29 +126,32 @@ io.on("connection", socket => {
     const room = rooms[roomCode];
     if (!room) return;
 
-    room.scores[votedFor] += 1;
+    if (room.votes[socket.id]) return;
 
-    room.round++;
+    room.votes[socket.id] = votedFor;
+    room.scores[votedFor]++;
 
-    if (room.round >= room.maxRounds) {
-      const finalScores = {};
-      Object.keys(room.players).forEach(id => {
-        finalScores[room.players[id]] = room.scores[id];
-      });
+    if (Object.keys(room.votes).length === Object.keys(room.players).length) {
+      room.round++;
 
-      io.to(roomCode).emit("game-over", finalScores);
-    } else {
-      startRound(roomCode);
+      if (room.round >= room.maxRounds) {
+        const finalScores = {};
+        Object.keys(room.players).forEach(id => {
+          finalScores[room.players[id]] = room.scores[id];
+        });
+
+        io.to(roomCode).emit("game-over", finalScores);
+      } else {
+        startRound(roomCode);
+      }
     }
   });
 
-  // DISCONNECT
   socket.on("disconnect", () => {
     for (const code in rooms) {
       if (rooms[code].players[socket.id]) {
         delete rooms[code].players[socket.id];
         delete rooms[code].scores[socket.id];
-
         io.to(code).emit("player-update", Object.values(rooms[code].players));
       }
     }
