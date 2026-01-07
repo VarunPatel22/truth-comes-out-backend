@@ -95,9 +95,19 @@ io.on("connection", socket => {
     const questions = snap.docs.map(d => d.data());
     const q = questions[Math.floor(Math.random() * questions.length)];
 
-    io.to(roomCode).emit("new-question", {
-      text: q.text
-    });
+    const players = Object.values(room.players); // array of names
+    const randomName =
+     players[Math.floor(Math.random() * players.length)];
+
+     let questionText = question.text;
+
+// 🔥 REPLACE {{name}} HERE (BACKEND ONLY)
+     questionText = questionText.replace(/\{\{name\}\}/gi, randomName);
+
+     io.to(roomCode).emit("new-question", {
+     text: questionText
+});
+
   }
 
   // SUBMIT ANSWER
