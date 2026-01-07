@@ -11,7 +11,6 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// 🔐 Firebase
 admin.initializeApp({
   credential: admin.credential.cert(
     JSON.parse(process.env.FIREBASE_KEY)
@@ -19,8 +18,6 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
-
-// ---------------- GAME STATE ----------------
 const rooms = {};
 
 function generateRoomCode() {
@@ -29,23 +26,20 @@ function generateRoomCode() {
 
 io.on("connection", socket => {
 
-  // CREATE ROOM
   socket.on("create-room", ({ name }) => {
     const roomCode = generateRoomCode();
 
     rooms[roomCode] = {
       host: socket.id,
-      players: {},
-      scores: {},
+      players: { [socket.id]: name },
+      scores: { [socket.id]: 0 },
       answers: [],
-      votes: {},
+      submitted: new Set(),
+      phase: "lobby",
       round: 0,
       maxRounds: 10,
-      gameStarted: false
+      timer: null
     };
-
-    rooms[roomCode].players[socket.id] = name;
-    rooms[roomCode].scores[socket.id] = 0;
 
     socket.join(roomCode);
     socket.emit("room-created", {
@@ -54,112 +48,128 @@ io.on("connection", socket => {
     });
   });
 
-  // JOIN ROOM
   socket.on("join-room", ({ roomCode, name }) => {
     const room = rooms[roomCode];
     if (!room) return;
 
     room.players[socket.id] = name;
     room.scores[socket.id] = 0;
-
     socket.join(roomCode);
+
     io.to(roomCode).emit("player-update", Object.values(room.players));
   });
 
-  // SET ROUNDS
   socket.on("set-rounds", ({ roomCode, rounds }) => {
     if (rooms[roomCode]?.host === socket.id) {
       rooms[roomCode].maxRounds = rounds;
     }
   });
 
-  // START GAME
   socket.on("start-game", roomCode => {
-    const room = rooms[roomCode];
-    if (!room || room.host !== socket.id) return;
-
-    room.round = 0;
+    if (rooms[roomCode]?.host !== socket.id) return;
+    rooms[roomCode].round = 0;
     startRound(roomCode);
   });
 
-  // START ROUND
   async function startRound(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
 
+    room.phase = "answer";
     room.answers = [];
-    room.votes = {};
+    room.submitted.clear();
 
     const snap = await db.collection("questions").get();
     const questions = snap.docs.map(d => d.data());
     const q = questions[Math.floor(Math.random() * questions.length)];
 
-    const players = Object.values(room.players);
-    const randomName = players[Math.floor(Math.random() * players.length)];
+    const names = Object.values(room.players);
+    const randomName = names[Math.floor(Math.random() * names.length)];
+    const text = q.text.replace(/\{\{name\}\}/gi, randomName);
 
-    const questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
-
-    io.to(roomCode).emit("new-question", {
-      text: questionText
+    io.to(roomCode).emit("phase-answer", {
+      text,
+      round: room.round + 1,
+      totalRounds: room.maxRounds
     });
+
+    clearTimeout(room.timer);
+    room.timer = setTimeout(() => {
+      forceVote(roomCode);
+    }, 60000);
   }
 
-  // SUBMIT ANSWER
   socket.on("submit-answer", ({ roomCode, answer }) => {
     const room = rooms[roomCode];
-    if (!room) return;
+    if (!room || room.phase !== "answer") return;
+    if (room.submitted.has(socket.id)) return;
 
-    if (room.answers.find(a => a.author === socket.id)) return;
-
+    room.submitted.add(socket.id);
     room.answers.push({
       author: socket.id,
       text: answer || "🤡"
     });
 
-    if (room.answers.length === Object.keys(room.players).length) {
-      io.to(roomCode).emit("start-vote", room.answers);
+    io.to(roomCode).emit("submission-update", {
+      submitted: room.submitted.size,
+      total: Object.keys(room.players).length
+    });
+
+    if (room.submitted.size === Object.keys(room.players).length) {
+      forceVote(roomCode);
     }
   });
 
-  // VOTE
+  function forceVote(roomCode) {
+    const room = rooms[roomCode];
+    if (!room || room.phase !== "answer") return;
+
+    clearTimeout(room.timer);
+    room.phase = "vote";
+
+    if (Object.keys(room.players).length <= 1) {
+      room.round++;
+      startRound(roomCode);
+      return;
+    }
+
+    io.to(roomCode).emit("phase-vote", room.answers);
+  }
+
   socket.on("vote", ({ roomCode, votedFor }) => {
     const room = rooms[roomCode];
-    if (!room) return;
+    if (!room || room.phase !== "vote") return;
 
-    if (room.votes[socket.id]) return;
-
-    room.votes[socket.id] = votedFor;
     room.scores[votedFor]++;
+    room.round++;
 
-    if (Object.keys(room.votes).length === Object.keys(room.players).length) {
-      room.round++;
-
-      if (room.round >= room.maxRounds) {
-        const finalScores = {};
-        Object.keys(room.players).forEach(id => {
-          finalScores[room.players[id]] = room.scores[id];
-        });
-
-        io.to(roomCode).emit("game-over", finalScores);
-      } else {
-        startRound(roomCode);
-      }
+    if (room.round >= room.maxRounds) {
+      endGame(roomCode);
+    } else {
+      startRound(roomCode);
     }
   });
+
+  function endGame(roomCode) {
+    const room = rooms[roomCode];
+    const scores = {};
+    Object.keys(room.players).forEach(id => {
+      scores[room.players[id]] = room.scores[id];
+    });
+    io.to(roomCode).emit("game-over", scores);
+  }
 
   socket.on("disconnect", () => {
     for (const code in rooms) {
-      if (rooms[code].players[socket.id]) {
-        delete rooms[code].players[socket.id];
-        delete rooms[code].scores[socket.id];
-        io.to(code).emit("player-update", Object.values(rooms[code].players));
+      const room = rooms[code];
+      if (room.players[socket.id]) {
+        delete room.players[socket.id];
+        delete room.scores[socket.id];
+        room.submitted.delete(socket.id);
+        io.to(code).emit("player-update", Object.values(room.players));
       }
     }
   });
 });
 
-// ---------------- SERVER ----------------
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log("Backend running on", PORT);
-});
+server.listen(3000, () => console.log("Server running"));
