@@ -71,27 +71,42 @@ io.on("connection", socket => {
     startRound(roomCode);
   });
 
-  async function startRound(roomCode) {
-    const room = rooms[roomCode];
-    if (!room) return;
+async function startRound(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
 
-    room.phase = "answer";
-    room.answers = [];
-    room.submitted.clear();
+  room.answers = [];
 
-    const snap = await db.collection("questions").get();
-    const questions = snap.docs.map(d => d.data());
-    const q = questions[Math.floor(Math.random() * questions.length)];
+  const snap = await db.collection("questions").get();
+  if (snap.empty) {
+    console.log("❌ No questions found");
+    return;
+  }
 
-    const names = Object.values(room.players);
-    const randomName = names[Math.floor(Math.random() * names.length)];
-    const text = q.text.replace(/\{\{name\}\}/gi, randomName);
+  const questions = snap.docs
+    .map(d => d.data())
+    .filter(q => typeof q.text === "string" && q.text.trim() !== "");
 
-    io.to(roomCode).emit("phase-answer", {
-      text,
-      round: room.round + 1,
-      totalRounds: room.maxRounds
-    });
+  if (questions.length === 0) {
+    console.log("❌ No valid questions with text field");
+    return;
+  }
+
+  const q = questions[Math.floor(Math.random() * questions.length)];
+
+  const players = Object.values(room.players);
+  const randomName =
+    players[Math.floor(Math.random() * players.length)] || "someone";
+
+  const questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
+
+  io.to(roomCode).emit("new-question", {
+    text: questionText
+  });
+
+  console.log("✅ Question sent:", questionText);
+}
+
 
     clearTimeout(room.timer);
     room.timer = setTimeout(() => {
