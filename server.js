@@ -1,102 +1,39 @@
 import express from "express";
-import http from "http";
-import { Server } from "socket.io";
 import cors from "cors";
 import admin from "firebase-admin";
-import fs from "fs";
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// 🔐 Firebase Admin from ENV
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
 admin.initializeApp({
-  credential: admin.credential.cert(
-    JSON.parse(process.env.FIREBASE_KEY)
-  )
+  credential: admin.credential.cert(serviceAccount),
 });
 
 const db = admin.firestore();
 
-const app = express();
-app.use(cors());
-
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
-
-const rooms = {};
-
-function genRoom() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
-
-io.on("connection", socket => {
-
-  socket.on("create-room", ({ name, spicy }) => {
-    const room = genRoom();
-    rooms[room] = {
-      host: socket.id,
-      spicy,
-      players: {},
-      answers: [],
-      target: null
-    };
-
-    rooms[room].players[socket.id] = { name, score: 0 };
-    socket.join(room);
-
-    socket.emit("room-created", { room, isHost: true });
-  });
-
-  socket.on("join-room", ({ room, name }) => {
-    if (!rooms[room]) return;
-
-    rooms[room].players[socket.id] = { name, score: 0 };
-    socket.join(room);
-
-    socket.emit("room-joined", { room, isHost: false });
-  });
-
-  socket.on("start-round", async room => {
-    if (!rooms[room]) return;
-
-    const allowed = rooms[room].spicy ? ["normal", "spicy"] : ["normal"];
-
-    const snap = await db
-      .collection("questions")
-      .where("type", "in", allowed)
-      .get();
-
-    if (snap.empty) return;
-
-    const qs = snap.docs.map(d => d.data());
-    const q = qs[Math.floor(Math.random() * qs.length)];
-
-    const ids = Object.keys(rooms[room].players);
-    const target = ids[Math.floor(Math.random() * ids.length)];
-
-    rooms[room].target = target;
-    rooms[room].answers = [];
-
-    io.to(room).emit("question", {
-      text: q.text.replace("{{name}}", rooms[room].players[target].name)
-    });
-  });
-
-  socket.on("submit-answer", ({ room, answer }) => {
-    rooms[room].answers.push({ id: socket.id, answer });
-
-    if (rooms[room].answers.length === Object.keys(rooms[room].players).length) {
-      io.to(room).emit(
-        "vote-phase",
-        rooms[room].answers.sort(() => Math.random() - 0.5)
-      );
-    }
-  });
-
-  socket.on("vote", ({ room, picked }) => {
-    if (picked === rooms[room].target)
-      rooms[room].players[socket.id].score += 100;
-    else
-      rooms[room].players[picked].score += 50;
-
-    io.to(room).emit("scores", rooms[room].players);
-  });
+// ✅ ROOT CHECK (optional but helpful)
+app.get("/", (req, res) => {
+  res.send("🎭 Truth Comes Out Backend is running");
 });
 
-server.listen(3000, () => console.log("Backend running on 3000"));
+// ✅ QUESTIONS API (THIS WAS MISSING)
+app.get("/questions", async (req, res) => {
+  try {
+    const snapshot = await db.collection("questions").get();
+    const questions = snapshot.docs.map(doc => doc.data());
+    res.json(questions);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch questions" });
+  }
+});
+
+// ✅ REQUIRED FOR RENDER
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("Backend running on", PORT);
+});
