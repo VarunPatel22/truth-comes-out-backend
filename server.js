@@ -7,7 +7,7 @@ import fs from "fs";
 
 admin.initializeApp({
   credential: admin.credential.cert(
-    JSON.parse(fs.readFileSync("./firebaseKey.json"))
+    JSON.parse(process.env.FIREBASE_KEY)
   )
 });
 
