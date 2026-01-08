@@ -15,32 +15,17 @@ const io = new Server(server, {
   cors: { origin: "*" }
 });
 
-// ---------------- FIREBASE SAFE INIT (FIXED) ----------------
+// ---------------- FIREBASE INIT ----------------
 let db = null;
 
 try {
-  if (
-    !process.env.FIREBASE_PROJECT_ID ||
-    !process.env.FIREBASE_CLIENT_EMAIL ||
-    !process.env.FIREBASE_PRIVATE_KEY
-  ) {
-    throw new Error("Firebase env vars missing");
-  }
-
   admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    }),
+    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY))
   });
-
   db = admin.firestore();
   console.log("✅ Firebase connected");
-
 } catch (err) {
   console.error("❌ Firebase init failed:", err.message);
-  db = null;
 }
 
 // ---------------- GAME STATE ----------------
@@ -53,7 +38,6 @@ function generateRoomCode() {
 // ---------------- SOCKET LOGIC ----------------
 io.on("connection", socket => {
 
-  // CREATE ROOM
   socket.on("create-room", ({ name }) => {
     const roomCode = generateRoomCode();
 
@@ -76,7 +60,6 @@ io.on("connection", socket => {
     });
   });
 
-  // JOIN ROOM
   socket.on("join-room", ({ roomCode, name }) => {
     const room = rooms[roomCode];
     if (!room) return;
@@ -85,29 +68,22 @@ io.on("connection", socket => {
     room.scores[socket.id] = 0;
     socket.join(roomCode);
 
-    io.to(roomCode).emit(
-      "player-update",
-      Object.values(room.players)
-    );
+    io.to(roomCode).emit("player-update", Object.values(room.players));
   });
 
-  // SET ROUNDS
   socket.on("set-rounds", ({ roomCode, rounds }) => {
     if (rooms[roomCode]?.host === socket.id) {
       rooms[roomCode].maxRounds = rounds;
     }
   });
 
-  // START GAME
   socket.on("start-game", roomCode => {
     const room = rooms[roomCode];
     if (!room || room.host !== socket.id) return;
-
     room.round = 0;
     startRound(roomCode);
   });
 
-  // ---------------- START ROUND ----------------
   async function startRound(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
@@ -121,26 +97,17 @@ io.on("connection", socket => {
     if (db) {
       try {
         const snap = await db.collection("questions").get();
-        const valid = snap.docs
-          .map(d => d.data())
-          .filter(q => q?.text);
-
+        const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
         if (valid.length) {
           const q = valid[Math.floor(Math.random() * valid.length)];
           const names = Object.values(room.players);
-          const randomName =
-            names[Math.floor(Math.random() * names.length)] || "someone";
-
+          const randomName = names[Math.floor(Math.random() * names.length)];
           questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
         }
-      } catch (err) {
-        console.error("❌ Question fetch failed");
-      }
+      } catch {}
     }
 
-    io.to(roomCode).emit("new-question", {
-      text: questionText
-    });
+    io.to(roomCode).emit("new-question", { text: questionText });
 
     clearTimeout(room.timer);
     room.timer = setTimeout(() => {
@@ -148,17 +115,13 @@ io.on("connection", socket => {
     }, 60000);
   }
 
-  // ---------------- SUBMIT ANSWER ----------------
   socket.on("submit-answer", ({ roomCode, answer }) => {
     const room = rooms[roomCode];
     if (!room || room.phase !== "answer") return;
     if (room.submitted.has(socket.id)) return;
 
     room.submitted.add(socket.id);
-    room.answers.push({
-      author: socket.id,
-      text: answer || "🤡"
-    });
+    room.answers.push({ author: socket.id, text: answer || "🤡" });
 
     io.to(roomCode).emit("submission-update", {
       submitted: room.submitted.size,
@@ -170,7 +133,7 @@ io.on("connection", socket => {
     }
   });
 
-  // ---------------- FORCE VOTE ----------------
+  // 🔥 FIXED: ALWAYS ENTER VOTING
   function forceVote(roomCode) {
     const room = rooms[roomCode];
     if (!room || room.phase !== "answer") return;
@@ -178,18 +141,9 @@ io.on("connection", socket => {
     clearTimeout(room.timer);
     room.phase = "vote";
 
-    if (room.answers.length <= 1) {
-      room.round++;
-      return room.round >= room.maxRounds
-        ? endGame(roomCode)
-        : startRound(roomCode);
-    }
-
-    io.to(roomCode).emit("start-vote", room.answers);
-
+    io.to(roomCode).emit("phase-vote", room.answers);
   }
 
-  // ---------------- VOTE ----------------
   socket.on("vote", ({ roomCode, votedFor }) => {
     const room = rooms[roomCode];
     if (!room || room.phase !== "vote") return;
@@ -205,20 +159,15 @@ io.on("connection", socket => {
       : startRound(roomCode);
   });
 
-  // ---------------- END GAME ----------------
   function endGame(roomCode) {
     const room = rooms[roomCode];
-    if (!room) return;
-
     const scores = {};
     Object.keys(room.players).forEach(id => {
       scores[room.players[id]] = room.scores[id];
     });
-
     io.to(roomCode).emit("game-over", scores);
   }
 
-  // ---------------- DISCONNECT ----------------
   socket.on("disconnect", () => {
     for (const code in rooms) {
       const room = rooms[code];
@@ -226,11 +175,7 @@ io.on("connection", socket => {
         delete room.players[socket.id];
         delete room.scores[socket.id];
         room.submitted.delete(socket.id);
-
-        io.to(code).emit(
-          "player-update",
-          Object.values(room.players)
-        );
+        io.to(code).emit("player-update", Object.values(room.players));
       }
     }
   });
