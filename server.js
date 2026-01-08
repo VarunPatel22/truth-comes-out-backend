@@ -5,6 +5,7 @@ import cors from "cors";
 import { Server } from "socket.io";
 import admin from "firebase-admin";
 
+// ---------------- BASIC SETUP ----------------
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -14,6 +15,7 @@ const io = new Server(server, {
   cors: { origin: "*" }
 });
 
+// ---------------- FIREBASE INIT ----------------
 let db = null;
 try {
   admin.initializeApp({
@@ -25,12 +27,14 @@ try {
   console.log("⚠ Firebase disabled");
 }
 
+// ---------------- GAME STATE ----------------
 const rooms = {};
 
 function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+// ---------------- SOCKET LOGIC ----------------
 io.on("connection", socket => {
 
   socket.on("create-room", ({ name }) => {
@@ -41,7 +45,6 @@ io.on("connection", socket => {
       scores: { [socket.id]: 0 },
       answers: [],
       submitted: new Set(),
-      votedPlayers: new Set(), // Track who has voted
       phase: "lobby",
       round: 0,
       maxRounds: 10,
@@ -85,27 +88,24 @@ io.on("connection", socket => {
     room.voteStarted = false;
     room.answers = [];
     room.submitted.clear();
-    room.votedPlayers.clear(); // Clear votes for new round
 
     let questionText = "Say something funny 😄";
 
     if (db) {
-      try {
-        const snap = await db.collection("questions").get();
-        const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
-        if (valid.length) {
-          const q = valid[Math.floor(Math.random() * valid.length)];
-          const names = Object.values(room.players);
-          const randomName = names[Math.floor(Math.random() * names.length)];
-          questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
-        }
-      } catch (err) { console.log("DB Error", err); }
+      const snap = await db.collection("questions").get();
+      const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
+      if (valid.length) {
+        const q = valid[Math.floor(Math.random() * valid.length)];
+        const names = Object.values(room.players);
+        const randomName = names[Math.floor(Math.random() * names.length)];
+        questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
+      }
     }
 
     io.to(roomCode).emit("new-question", { text: questionText });
 
     clearTimeout(room.timer);
-    room.timer = setTimeout(() => forceVote(roomCode), 65000); // Buffer for network
+    room.timer = setTimeout(() => forceVote(roomCode), 60000);
   }
 
   socket.on("submit-answer", ({ roomCode, answer }) => {
@@ -134,30 +134,23 @@ io.on("connection", socket => {
     room.phase = "vote";
     clearTimeout(room.timer);
 
+    console.log("🗳 Entering vote phase", roomCode);
+
     io.to(roomCode).emit("phase-vote", room.answers);
   }
 
   socket.on("vote", ({ roomCode, votedFor }) => {
     const room = rooms[roomCode];
     if (!room || room.phase !== "vote") return;
-    if (room.votedPlayers.has(socket.id)) return; // Prevent double voting
-
-    room.votedPlayers.add(socket.id);
 
     if (room.scores[votedFor] !== undefined) {
       room.scores[votedFor]++;
     }
 
-    // Wait for ALL players to vote before moving on
-    if (room.votedPlayers.size === Object.keys(room.players).length) {
-      room.round++;
-      if (room.round >= room.maxRounds) {
-        endGame(roomCode);
-      } else {
-        // Small delay so players see the "Vote submitted" message
-        setTimeout(() => startRound(roomCode), 2000);
-      }
-    }
+    room.round++;
+    room.round >= room.maxRounds
+      ? endGame(roomCode)
+      : startRound(roomCode);
   });
 
   function endGame(roomCode) {
