@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Serve static assets (try both public/icons and frontend/icons so either location works)
+// Serve static assets (both public/icons and frontend/icons supported)
 app.use('/icons', express.static(path.join(process.cwd(), 'public', 'icons')));
 app.use('/icons', express.static(path.join(process.cwd(), 'frontend', 'icons')));
 
@@ -75,13 +75,21 @@ io.on("connection", socket => {
     };
 
     socket.join(roomCode);
-    // send room created + players
+
+    // Room created: send roomCode, players array and host id
     socket.emit("room-created", {
       roomCode,
-      players: Object.values(rooms[roomCode].players)
+      players: Object.values(rooms[roomCode].players),
+      host: rooms[roomCode].host
     });
 
-    // send initial scores so host can see scoreboard right away
+    // emit initial player list to room (including host id)
+    io.to(roomCode).emit("player-update", {
+      players: Object.values(rooms[roomCode].players),
+      host: rooms[roomCode].host
+    });
+
+    // send initial scores so host/clients see the scoreboard
     emitScores(roomCode);
   });
 
@@ -94,12 +102,14 @@ io.on("connection", socket => {
     room.scores[socket.id] = 0;
 
     socket.join(roomCode);
-    io.to(roomCode).emit(
-      "player-update",
-      Object.values(room.players)
-    );
 
-    // broadcast updated scores immediately (keeps scoreboard current)
+    // send updated players + host id to everyone
+    io.to(roomCode).emit("player-update", {
+      players: Object.values(room.players),
+      host: room.host
+    });
+
+    // update scores for everyone
     emitScores(roomCode);
   });
 
@@ -107,10 +117,13 @@ io.on("connection", socket => {
   socket.on("set-rounds", ({ roomCode, rounds }) => {
     if (rooms[roomCode]?.host === socket.id) {
       rooms[roomCode].maxRounds = rounds;
+      // broadcast the updated rounds value (optional for client UI if needed)
+      io.to(roomCode).emit("rounds-updated", { maxRounds: rounds });
     }
   });
 
   socket.on("start-game", roomCode => {
+    // Only allow host to actually start the game
     if (rooms[roomCode]?.host !== socket.id) return;
     rooms[roomCode].round = 0;
     startRound(roomCode);
@@ -180,7 +193,7 @@ io.on("connection", socket => {
     room.votes = {};
 
     io.to(roomCode).emit("phase-vote", room.answers);
-    // Also send current scores to clients (keep live)
+    // Also send current scores to clients
     emitScores(roomCode);
   }
 
@@ -246,8 +259,11 @@ io.on("connection", socket => {
           const remaining = Object.keys(room.players);
           room.host = remaining.length ? remaining[0] : null;
         }
-        // emit updated player list as array of { name, avatar }
-        io.to(rc).emit("player-update", Object.values(room.players).map(p => ({ name: p.name, avatar: p.avatar })));
+        // emit updated player list as array of { name, avatar } and host id
+        io.to(rc).emit("player-update", {
+          players: Object.values(room.players),
+          host: room.host
+        });
         // update scores as well
         emitScores(rc);
       }
