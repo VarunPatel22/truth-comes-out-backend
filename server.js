@@ -185,7 +185,8 @@ io.on("connection", socket => {
         : startRound(roomCode);
     }
 
-    io.to(roomCode).emit("phase-vote", room.answers);
+    io.to(roomCode).emit("start-vote", room.answers);
+
   }
 
   // ---------------- VOTE ----------------
