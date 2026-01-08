@@ -1,31 +1,56 @@
+import "dotenv/config";
 import express from "express";
 import http from "http";
 import cors from "cors";
 import { Server } from "socket.io";
 import admin from "firebase-admin";
 
+// ---------------- BASIC SETUP ----------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
-
-// 🔐 Firebase
-admin.initializeApp({
-  credential: admin.credential.cert(
-    JSON.parse(process.env.FIREBASE_KEY)
-  )
+const io = new Server(server, {
+  cors: { origin: "*" }
 });
 
-const db = admin.firestore();
+// ---------------- FIREBASE SAFE INIT (FIXED) ----------------
+let db = null;
+
+try {
+  if (
+    !process.env.FIREBASE_PROJECT_ID ||
+    !process.env.FIREBASE_CLIENT_EMAIL ||
+    !process.env.FIREBASE_PRIVATE_KEY
+  ) {
+    throw new Error("Firebase env vars missing");
+  }
+
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    }),
+  });
+
+  db = admin.firestore();
+  console.log("✅ Firebase connected");
+
+} catch (err) {
+  console.error("❌ Firebase init failed:", err.message);
+  db = null;
+}
+
+// ---------------- GAME STATE ----------------
 const rooms = {};
 
 function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-// ================= SOCKET =================
+// ---------------- SOCKET LOGIC ----------------
 io.on("connection", socket => {
 
   // CREATE ROOM
@@ -38,10 +63,9 @@ io.on("connection", socket => {
       scores: { [socket.id]: 0 },
       answers: [],
       submitted: new Set(),
-      votes: new Set(),
       phase: "lobby",
       round: 0,
-      maxRounds: 5,
+      maxRounds: 10,
       timer: null
     };
 
@@ -61,7 +85,10 @@ io.on("connection", socket => {
     room.scores[socket.id] = 0;
     socket.join(roomCode);
 
-    io.to(roomCode).emit("player-update", Object.values(room.players));
+    io.to(roomCode).emit(
+      "player-update",
+      Object.values(room.players)
+    );
   });
 
   // SET ROUNDS
@@ -73,45 +100,55 @@ io.on("connection", socket => {
 
   // START GAME
   socket.on("start-game", roomCode => {
-    if (rooms[roomCode]?.host !== socket.id) return;
-    rooms[roomCode].round = 0;
+    const room = rooms[roomCode];
+    if (!room || room.host !== socket.id) return;
+
+    room.round = 0;
     startRound(roomCode);
   });
 
-  // ================= ROUND =================
+  // ---------------- START ROUND ----------------
   async function startRound(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
 
-    clearTimeout(room.timer);
-
     room.phase = "answer";
     room.answers = [];
-    room.submitted = new Set();
-    room.votes = new Set();
+    room.submitted.clear();
 
-    // Fetch question
     let questionText = "Say something funny 😄";
-    const snap = await db.collection("questions").get();
-    if (!snap.empty) {
-      const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
-      if (valid.length) {
-        const q = valid[Math.floor(Math.random() * valid.length)];
-        const names = Object.values(room.players);
-        const randomName = names[Math.floor(Math.random() * names.length)] || "someone";
-        questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
+
+    if (db) {
+      try {
+        const snap = await db.collection("questions").get();
+        const valid = snap.docs
+          .map(d => d.data())
+          .filter(q => q?.text);
+
+        if (valid.length) {
+          const q = valid[Math.floor(Math.random() * valid.length)];
+          const names = Object.values(room.players);
+          const randomName =
+            names[Math.floor(Math.random() * names.length)] || "someone";
+
+          questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
+        }
+      } catch (err) {
+        console.error("❌ Question fetch failed");
       }
     }
 
-    io.to(roomCode).emit("new-question", { text: questionText });
+    io.to(roomCode).emit("new-question", {
+      text: questionText
+    });
 
-    // Answer timer (60s)
+    clearTimeout(room.timer);
     room.timer = setTimeout(() => {
-      startVote(roomCode);
+      forceVote(roomCode);
     }, 60000);
   }
 
-  // SUBMIT ANSWER
+  // ---------------- SUBMIT ANSWER ----------------
   socket.on("submit-answer", ({ roomCode, answer }) => {
     const room = rooms[roomCode];
     if (!room || room.phase !== "answer") return;
@@ -129,59 +166,58 @@ io.on("connection", socket => {
     });
 
     if (room.submitted.size === Object.keys(room.players).length) {
-      startVote(roomCode);
+      forceVote(roomCode);
     }
   });
 
-  // ================= VOTING =================
-  function startVote(roomCode) {
+  // ---------------- FORCE VOTE ----------------
+  function forceVote(roomCode) {
     const room = rooms[roomCode];
     if (!room || room.phase !== "answer") return;
 
     clearTimeout(room.timer);
     room.phase = "vote";
 
-    io.to(roomCode).emit("phase-vote", room.answers);
+    if (room.answers.length <= 1) {
+      room.round++;
+      return room.round >= room.maxRounds
+        ? endGame(roomCode)
+        : startRound(roomCode);
+    }
 
-    // Vote timer (30s)
-    room.timer = setTimeout(() => {
-      endRound(roomCode);
-    }, 30000);
+    io.to(roomCode).emit("phase-vote", room.answers);
   }
 
+  // ---------------- VOTE ----------------
   socket.on("vote", ({ roomCode, votedFor }) => {
     const room = rooms[roomCode];
     if (!room || room.phase !== "vote") return;
-    if (room.votes.has(socket.id)) return;
 
-    room.votes.add(socket.id);
-    room.scores[votedFor] = (room.scores[votedFor] || 0) + 1;
-
-    if (room.votes.size === Object.keys(room.players).length) {
-      endRound(roomCode);
+    if (room.scores[votedFor] !== undefined) {
+      room.scores[votedFor]++;
     }
+
+    room.round++;
+
+    room.round >= room.maxRounds
+      ? endGame(roomCode)
+      : startRound(roomCode);
   });
 
-  // ================= END ROUND =================
-  function endRound(roomCode) {
+  // ---------------- END GAME ----------------
+  function endGame(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
 
-    clearTimeout(room.timer);
-    room.round++;
+    const scores = {};
+    Object.keys(room.players).forEach(id => {
+      scores[room.players[id]] = room.scores[id];
+    });
 
-    if (room.round >= room.maxRounds) {
-      const finalScores = {};
-      Object.keys(room.players).forEach(id => {
-        finalScores[room.players[id]] = room.scores[id];
-      });
-      io.to(roomCode).emit("game-over", finalScores);
-    } else {
-      startRound(roomCode);
-    }
+    io.to(roomCode).emit("game-over", scores);
   }
 
-  // DISCONNECT
+  // ---------------- DISCONNECT ----------------
   socket.on("disconnect", () => {
     for (const code in rooms) {
       const room = rooms[code];
@@ -189,11 +225,18 @@ io.on("connection", socket => {
         delete room.players[socket.id];
         delete room.scores[socket.id];
         room.submitted.delete(socket.id);
-        room.votes.delete(socket.id);
-        io.to(code).emit("player-update", Object.values(room.players));
+
+        io.to(code).emit(
+          "player-update",
+          Object.values(room.players)
+        );
       }
     }
   });
 });
 
-server.listen(3000, () => console.log("✅ Server running on 3000"));
+// ---------------- START SERVER ----------------
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log("🚀 Server running on", PORT);
+});
