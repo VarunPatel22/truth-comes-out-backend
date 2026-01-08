@@ -34,6 +34,17 @@ function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+// Helper to broadcast name->score mapping
+function emitScores(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+  const mapping = {};
+  Object.keys(room.players).forEach(id => {
+    mapping[room.players[id]] = room.scores[id] || 0;
+  });
+  io.to(roomCode).emit("scores-update", mapping);
+}
+
 // ---------------- SOCKET LOGIC ----------------
 io.on("connection", socket => {
 
@@ -49,7 +60,8 @@ io.on("connection", socket => {
       round: 0,
       maxRounds: 10,
       timer: null,
-      voteStarted: false
+      voteStarted: false,
+      votes: {} // voterId => votedForId
     };
 
     socket.join(roomCode);
@@ -88,6 +100,7 @@ io.on("connection", socket => {
     room.voteStarted = false;
     room.answers = [];
     room.submitted.clear();
+    room.votes = {}; // reset votes for this round
 
     let questionText = "Say something funny 😄";
 
@@ -136,31 +149,79 @@ io.on("connection", socket => {
 
     console.log("🗳 Entering vote phase", roomCode);
 
+    // ensure votes object exists for this round
+    room.votes = {};
+
     io.to(roomCode).emit("phase-vote", room.answers);
+    // Also send current scores to clients
+    emitScores(roomCode);
   }
 
   socket.on("vote", ({ roomCode, votedFor }) => {
     const room = rooms[roomCode];
     if (!room || room.phase !== "vote") return;
 
+    // Prevent multiple votes from same socket this round
+    if (room.votes[socket.id]) return;
+
+    // Prevent voting for yourself (defensive)
+    if (votedFor === socket.id) return;
+
+    // record the vote
+    room.votes[socket.id] = votedFor;
+
+    // increment score immediately so players see points as votes arrive
     if (room.scores[votedFor] !== undefined) {
       room.scores[votedFor]++;
     }
 
-    room.round++;
-    room.round >= room.maxRounds
-      ? endGame(roomCode)
-      : startRound(roomCode);
+    // broadcast updated scores to all clients
+    emitScores(roomCode);
+
+    // Check if all players have voted (one vote per player)
+    const totalPlayers = Object.keys(room.players).length;
+    const votesCount = Object.keys(room.votes).length;
+
+    if (votesCount >= totalPlayers) {
+      // All votes in: advance round (or end game).
+      room.round++;
+      if (room.round >= room.maxRounds) {
+        // small delay so clients can see final votes/score
+        setTimeout(() => endGame(roomCode), 2000);
+      } else {
+        // delay a moment to show scores to players before starting next round
+        setTimeout(() => startRound(roomCode), 2000);
+      }
+    }
   });
 
   function endGame(roomCode) {
     const room = rooms[roomCode];
+    if (!room) return;
     const scores = {};
     Object.keys(room.players).forEach(id => {
       scores[room.players[id]] = room.scores[id];
     });
     io.to(roomCode).emit("game-over", scores);
   }
+
+  // handle disconnect: remove player and notify room (basic)
+  socket.on("disconnect", () => {
+    // find any room containing this socket
+    Object.keys(rooms).forEach(rc => {
+      const room = rooms[rc];
+      if (room.players[socket.id]) {
+        delete room.players[socket.id];
+        delete room.scores[socket.id];
+        // If host left, optionally reassign host to another player
+        if (room.host === socket.id) {
+          const remaining = Object.keys(room.players);
+          room.host = remaining.length ? remaining[0] : null;
+        }
+        io.to(rc).emit("player-update", Object.values(room.players));
+      }
+    });
+  });
 });
 
 server.listen(process.env.PORT || 3000, () =>
