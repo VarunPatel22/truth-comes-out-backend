@@ -4,11 +4,16 @@ import http from "http";
 import cors from "cors";
 import { Server } from "socket.io";
 import admin from "firebase-admin";
+import path from "path";
 
 // ---------------- BASIC SETUP ----------------
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Serve static assets (try both public/icons and frontend/icons so either location works)
+app.use('/icons', express.static(path.join(process.cwd(), 'public', 'icons')));
+app.use('/icons', express.static(path.join(process.cwd(), 'frontend', 'icons')));
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -40,7 +45,9 @@ function emitScores(roomCode) {
   if (!room) return;
   const mapping = {};
   Object.keys(room.players).forEach(id => {
-    mapping[room.players[id]] = room.scores[id] || 0;
+    const playerObj = room.players[id];
+    const displayName = playerObj?.name || String(id);
+    mapping[displayName] = room.scores[id] || 0;
   });
   io.to(roomCode).emit("scores-update", mapping);
 }
@@ -48,11 +55,14 @@ function emitScores(roomCode) {
 // ---------------- SOCKET LOGIC ----------------
 io.on("connection", socket => {
 
-  socket.on("create-room", ({ name }) => {
+  socket.on("create-room", ({ name, avatar }) => {
     const roomCode = generateRoomCode();
+
     rooms[roomCode] = {
       host: socket.id,
-      players: { [socket.id]: name },
+      players: {
+        [socket.id]: { name: name || "Host", avatar: avatar || "/icons/icon-1.jpg" }
+      },
       scores: { [socket.id]: 0 },
       answers: [],
       submitted: new Set(),
@@ -61,7 +71,7 @@ io.on("connection", socket => {
       maxRounds: 10,
       timer: null,
       voteStarted: false,
-      votes: {} // voterId => votedForId
+      votes: {}
     };
 
     socket.join(roomCode);
@@ -71,14 +81,21 @@ io.on("connection", socket => {
     });
   });
 
-  socket.on("join-room", ({ roomCode, name }) => {
+
+  socket.on("join-room", ({ roomCode, name, avatar }) => {
     const room = rooms[roomCode];
     if (!room) return;
-    room.players[socket.id] = name;
+
+    room.players[socket.id] = { name: name || "Player", avatar: avatar || "/icons/icon-1.jpg" };
     room.scores[socket.id] = 0;
+
     socket.join(roomCode);
-    io.to(roomCode).emit("player-update", Object.values(room.players));
+    io.to(roomCode).emit(
+      "player-update",
+      Object.values(room.players)
+    );
   });
+
 
   socket.on("set-rounds", ({ roomCode, rounds }) => {
     if (rooms[roomCode]?.host === socket.id) {
@@ -109,7 +126,7 @@ io.on("connection", socket => {
       const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
       if (valid.length) {
         const q = valid[Math.floor(Math.random() * valid.length)];
-        const names = Object.values(room.players);
+        const names = Object.values(room.players).map(p => p.name);
         const randomName = names[Math.floor(Math.random() * names.length)];
         questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
       }
@@ -200,7 +217,8 @@ io.on("connection", socket => {
     if (!room) return;
     const scores = {};
     Object.keys(room.players).forEach(id => {
-      scores[room.players[id]] = room.scores[id];
+      const displayName = room.players[id].name;
+      scores[displayName] = room.scores[id];
     });
     io.to(roomCode).emit("game-over", scores);
   }
@@ -218,7 +236,8 @@ io.on("connection", socket => {
           const remaining = Object.keys(room.players);
           room.host = remaining.length ? remaining[0] : null;
         }
-        io.to(rc).emit("player-update", Object.values(room.players));
+        // emit updated player list as array of { name, avatar }
+        io.to(rc).emit("player-update", Object.values(room.players).map(p => ({ name: p.name, avatar: p.avatar })));
       }
     });
   });
