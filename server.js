@@ -5,7 +5,6 @@ import cors from "cors";
 import { Server } from "socket.io";
 import admin from "firebase-admin";
 
-// ---------------- BASIC SETUP ----------------
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -15,42 +14,39 @@ const io = new Server(server, {
   cors: { origin: "*" }
 });
 
-// ---------------- FIREBASE INIT ----------------
 let db = null;
-
 try {
   admin.initializeApp({
     credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY))
   });
   db = admin.firestore();
   console.log("✅ Firebase connected");
-} catch (err) {
-  console.error("❌ Firebase init failed:", err.message);
+} catch (e) {
+  console.log("⚠ Firebase disabled");
 }
 
-// ---------------- GAME STATE ----------------
 const rooms = {};
 
 function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-// ---------------- SOCKET LOGIC ----------------
 io.on("connection", socket => {
 
   socket.on("create-room", ({ name }) => {
     const roomCode = generateRoomCode();
-
     rooms[roomCode] = {
       host: socket.id,
       players: { [socket.id]: name },
       scores: { [socket.id]: 0 },
       answers: [],
       submitted: new Set(),
+      votedPlayers: new Set(), // Track who has voted
       phase: "lobby",
       round: 0,
       maxRounds: 10,
-      timer: null
+      timer: null,
+      voteStarted: false
     };
 
     socket.join(roomCode);
@@ -63,11 +59,9 @@ io.on("connection", socket => {
   socket.on("join-room", ({ roomCode, name }) => {
     const room = rooms[roomCode];
     if (!room) return;
-
     room.players[socket.id] = name;
     room.scores[socket.id] = 0;
     socket.join(roomCode);
-
     io.to(roomCode).emit("player-update", Object.values(room.players));
   });
 
@@ -78,9 +72,8 @@ io.on("connection", socket => {
   });
 
   socket.on("start-game", roomCode => {
-    const room = rooms[roomCode];
-    if (!room || room.host !== socket.id) return;
-    room.round = 0;
+    if (rooms[roomCode]?.host !== socket.id) return;
+    rooms[roomCode].round = 0;
     startRound(roomCode);
   });
 
@@ -89,8 +82,10 @@ io.on("connection", socket => {
     if (!room) return;
 
     room.phase = "answer";
+    room.voteStarted = false;
     room.answers = [];
     room.submitted.clear();
+    room.votedPlayers.clear(); // Clear votes for new round
 
     let questionText = "Say something funny 😄";
 
@@ -104,15 +99,13 @@ io.on("connection", socket => {
           const randomName = names[Math.floor(Math.random() * names.length)];
           questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
         }
-      } catch {}
+      } catch (err) { console.log("DB Error", err); }
     }
 
     io.to(roomCode).emit("new-question", { text: questionText });
 
     clearTimeout(room.timer);
-    room.timer = setTimeout(() => {
-      forceVote(roomCode);
-    }, 60000);
+    room.timer = setTimeout(() => forceVote(roomCode), 65000); // Buffer for network
   }
 
   socket.on("submit-answer", ({ roomCode, answer }) => {
@@ -133,13 +126,13 @@ io.on("connection", socket => {
     }
   });
 
-  // 🔥 FIXED: ALWAYS ENTER VOTING
   function forceVote(roomCode) {
     const room = rooms[roomCode];
-    if (!room || room.phase !== "answer") return;
+    if (!room || room.voteStarted) return;
 
-    clearTimeout(room.timer);
+    room.voteStarted = true;
     room.phase = "vote";
+    clearTimeout(room.timer);
 
     io.to(roomCode).emit("phase-vote", room.answers);
   }
@@ -147,16 +140,24 @@ io.on("connection", socket => {
   socket.on("vote", ({ roomCode, votedFor }) => {
     const room = rooms[roomCode];
     if (!room || room.phase !== "vote") return;
+    if (room.votedPlayers.has(socket.id)) return; // Prevent double voting
+
+    room.votedPlayers.add(socket.id);
 
     if (room.scores[votedFor] !== undefined) {
       room.scores[votedFor]++;
     }
 
-    room.round++;
-
-    room.round >= room.maxRounds
-      ? endGame(roomCode)
-      : startRound(roomCode);
+    // Wait for ALL players to vote before moving on
+    if (room.votedPlayers.size === Object.keys(room.players).length) {
+      room.round++;
+      if (room.round >= room.maxRounds) {
+        endGame(roomCode);
+      } else {
+        // Small delay so players see the "Vote submitted" message
+        setTimeout(() => startRound(roomCode), 2000);
+      }
+    }
   });
 
   function endGame(roomCode) {
@@ -167,22 +168,8 @@ io.on("connection", socket => {
     });
     io.to(roomCode).emit("game-over", scores);
   }
-
-  socket.on("disconnect", () => {
-    for (const code in rooms) {
-      const room = rooms[code];
-      if (room.players[socket.id]) {
-        delete room.players[socket.id];
-        delete room.scores[socket.id];
-        room.submitted.delete(socket.id);
-        io.to(code).emit("player-update", Object.values(room.players));
-      }
-    }
-  });
 });
 
-// ---------------- START SERVER ----------------
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log("🚀 Server running on", PORT);
-});
+server.listen(process.env.PORT || 3000, () =>
+  console.log("🚀 Server running")
+);
