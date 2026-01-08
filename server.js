@@ -75,10 +75,14 @@ io.on("connection", socket => {
     };
 
     socket.join(roomCode);
+    // send room created + players
     socket.emit("room-created", {
       roomCode,
       players: Object.values(rooms[roomCode].players)
     });
+
+    // send initial scores so host can see scoreboard right away
+    emitScores(roomCode);
   });
 
 
@@ -94,6 +98,9 @@ io.on("connection", socket => {
       "player-update",
       Object.values(room.players)
     );
+
+    // broadcast updated scores immediately (keeps scoreboard current)
+    emitScores(roomCode);
   });
 
 
@@ -134,6 +141,9 @@ io.on("connection", socket => {
 
     io.to(roomCode).emit("new-question", { text: questionText });
 
+    // Emit current scores immediately so clients can display live scoreboard
+    emitScores(roomCode);
+
     clearTimeout(room.timer);
     room.timer = setTimeout(() => forceVote(roomCode), 60000);
   }
@@ -170,7 +180,7 @@ io.on("connection", socket => {
     room.votes = {};
 
     io.to(roomCode).emit("phase-vote", room.answers);
-    // Also send current scores to clients
+    // Also send current scores to clients (keep live)
     emitScores(roomCode);
   }
 
@@ -238,6 +248,8 @@ io.on("connection", socket => {
         }
         // emit updated player list as array of { name, avatar }
         io.to(rc).emit("player-update", Object.values(room.players).map(p => ({ name: p.name, avatar: p.avatar })));
+        // update scores as well
+        emitScores(rc);
       }
     });
   });
