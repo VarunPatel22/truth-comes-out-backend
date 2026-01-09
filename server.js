@@ -12,7 +12,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Serve static assets (both public/icons and frontend/icons supported)
+// Serve static 'public' so admin.html can be placed in ./public/admin.html
+app.use(express.static(path.join(process.cwd(), 'public')));
+
+// Serve static assets (icons)
 app.use('/icons', express.static(path.join(process.cwd(), 'public', 'icons')));
 app.use('/icons', express.static(path.join(process.cwd(), 'frontend', 'icons')));
 
@@ -70,11 +73,12 @@ try {
   });
 
   db = admin.firestore();
-  console.log("��� Firebase connected using ENV credentials");
+  console.log("✅ Firebase connected using ENV credentials");
 
 } catch (err) {
   console.error("❌ Firebase init failed:", err.message);
 }
+
 // ---------- ADMIN AUTH MIDDLEWARE ----------
 function adminAuth(req, res, next) {
   const key = req.headers["x-admin-key"];
@@ -310,8 +314,10 @@ io.on("connection", socket => {
   });
 });
 // ---------- ADMIN ROUTES ----------
+
 app.get("/admin/questions", adminAuth, async (req, res) => {
   try {
+    if (!db) return res.status(503).json({ error: "Database not initialized" });
     const snap = await db.collection("questions").orderBy("createdAt", "desc").get();
     const questions = snap.docs.map(d => ({
       id: d.id,
@@ -324,21 +330,31 @@ app.get("/admin/questions", adminAuth, async (req, res) => {
 });
 
 app.post("/admin/questions", adminAuth, async (req, res) => {
-  const { text } = req.body;
-  if (!text) return res.status(400).json({ error: "Question text required" });
+  try {
+    if (!db) return res.status(503).json({ error: "Database not initialized" });
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: "Question text required" });
 
-  const doc = await db.collection("questions").add({
-    text,
-    active: true,
-    createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
+    const doc = await db.collection("questions").add({
+      text,
+      active: true,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
-  res.json({ success: true, id: doc.id });
+    res.json({ success: true, id: doc.id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.delete("/admin/questions/:id", adminAuth, async (req, res) => {
-  await db.collection("questions").doc(req.params.id).delete();
-  res.json({ success: true });
+  try {
+    if (!db) return res.status(503).json({ error: "Database not initialized" });
+    await db.collection("questions").doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 server.listen(process.env.PORT || 3000, () =>
