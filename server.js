@@ -75,6 +75,14 @@ try {
 } catch (err) {
   console.error("❌ Firebase init failed:", err.message);
 }
+// ---------- ADMIN AUTH MIDDLEWARE ----------
+function adminAuth(req, res, next) {
+  const key = req.headers["x-admin-key"];
+  if (!key || key !== process.env.ADMIN_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
 
 // ---------------- GAME STATE ----------------
 const rooms = {};
@@ -300,6 +308,37 @@ io.on("connection", socket => {
     });
     console.log("🔌 client disconnected", socket.id);
   });
+});
+// ---------- ADMIN ROUTES ----------
+app.get("/admin/questions", adminAuth, async (req, res) => {
+  try {
+    const snap = await db.collection("questions").orderBy("createdAt", "desc").get();
+    const questions = snap.docs.map(d => ({
+      id: d.id,
+      ...d.data()
+    }));
+    res.json(questions);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/admin/questions", adminAuth, async (req, res) => {
+  const { text } = req.body;
+  if (!text) return res.status(400).json({ error: "Question text required" });
+
+  const doc = await db.collection("questions").add({
+    text,
+    active: true,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  res.json({ success: true, id: doc.id });
+});
+
+app.delete("/admin/questions/:id", adminAuth, async (req, res) => {
+  await db.collection("questions").doc(req.params.id).delete();
+  res.json({ success: true });
 });
 
 server.listen(process.env.PORT || 3000, () =>
