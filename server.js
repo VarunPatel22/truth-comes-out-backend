@@ -47,102 +47,34 @@ app.get('/_debug/clients', (req, res) => {
 });
 
 // ---------------- FIREBASE INIT (robust + project id handling) ----------------
+// ---------------- FIREBASE INIT (ENV BASED) ----------------
+// ---------------- FIREBASE INIT (ENV BASED) ----------------
 let db = null;
 
-async function initFirebase() {
-  const firebaseKeyEnv = process.env.FIREBASE_KEY || "";
-  const firebaseKeyPathEnv = process.env.FIREBASE_KEY_PATH || process.env.GOOGLE_APPLICATION_CREDENTIALS || "";
-  const explicitProjectId = process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || "";
-
-  // If emulator set, log it
-  if (process.env.FIRESTORE_EMULATOR_HOST) {
-    console.log("🔁 Using Firestore emulator at", process.env.FIRESTORE_EMULATOR_HOST);
+try {
+  if (
+    !process.env.FIREBASE_PROJECT_ID ||
+    !process.env.FIREBASE_CLIENT_EMAIL ||
+    !process.env.FIREBASE_PRIVATE_KEY
+  ) {
+    throw new Error("Missing Firebase ENV variables");
   }
 
-  // Helper to init by serviceAccount object
-  function initWithServiceAccount(serviceAccount) {
-    const projectId = serviceAccount.project_id || explicitProjectId || null;
-    const initOptions = {};
-    if (projectId) initOptions.projectId = projectId;
-    try {
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        ...(projectId ? { projectId } : {})
-      });
-      db = admin.firestore();
-      if (projectId) console.log(`✅ Firebase connected (service account) — projectId: ${projectId}`);
-      else console.log("✅ Firebase connected (service account) — projectId not explicitly set (may fail for Firestore ops)");
-      return true;
-    } catch (e) {
-      console.error("❌ admin.initializeApp(serviceAccount) failed:", e.message);
-      return false;
-    }
-  }
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
+    })
+  });
 
-  // 1) FIREBASE_KEY JSON string
-  if (firebaseKeyEnv && firebaseKeyEnv.trim().length > 0) {
-    try {
-      const serviceAccount = JSON.parse(firebaseKeyEnv);
-      if (initWithServiceAccount(serviceAccount)) return;
-    } catch (err) {
-      console.error("❌ Failed to parse FIREBASE_KEY JSON:", err.message);
-    }
-  }
+  db = admin.firestore();
+  console.log("✅ Firebase connected using ENV credentials");
 
-  // 2) FIREBASE_KEY_PATH file
-  if (firebaseKeyPathEnv && firebaseKeyPathEnv.trim().length > 0) {
-    const resolvedPath = path.resolve(firebaseKeyPathEnv);
-    if (fs.existsSync(resolvedPath)) {
-      try {
-        const serviceAccount = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
-        if (initWithServiceAccount(serviceAccount)) return;
-      } catch (err) {
-        console.error("❌ Failed to initialize Firebase from file:", resolvedPath, err.message);
-      }
-    } else {
-      console.warn(`⚠ FIREBASE_KEY_PATH not found: ${resolvedPath}`);
-    }
-  }
-
-  // 3) Try Application Default Credentials (ADC)
-  try {
-    // If explicit project id env present, use it for Firestore
-    if (explicitProjectId) {
-      admin.initializeApp({ projectId: explicitProjectId });
-      db = admin.firestore();
-      console.log("✅ Firebase initialized with Application Default Credentials and explicit projectId:", explicitProjectId);
-      return;
-    }
-
-    // Otherwise try plain ADC
-    admin.initializeApp();
-    db = admin.firestore();
-    console.log("✅ Firebase initialized with Application Default Credentials (projectId auto-detected if available)");
-    return;
-  } catch (err) {
-    console.warn("⚠ Firebase ADC init failed:", err.message);
-  }
-
-  // All attempts failed: show helpful guidance
-  console.log("⚠ Firebase not initialized. Provide credentials via:");
-  console.log("   - FIREBASE_KEY (JSON string)  OR");
-  console.log("   - FIREBASE_KEY_PATH (path to service account JSON)  OR");
-  console.log("   - Set GOOGLE_APPLICATION_CREDENTIALS and ensure project id is available via FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT.");
-  console.log("See https://firebase.google.com/docs/admin/setup for details.");
+} catch (err) {
+  console.error("❌ Firebase init failed:", err.message);
 }
 
-await initFirebase();
-
-// If we still have db and emulator, apply optional settings
-if (db && process.env.FIRESTORE_EMULATOR_HOST) {
-  try {
-    const projectId = process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || null;
-    if (projectId) db.settings({ projectId });
-    console.log("🔧 Applied Firestore emulator settings (if any)");
-  } catch (e) {
-    console.warn("⚠ Failed to apply Firestore emulator settings:", e.message);
-  }
-}
 
 // ---------------- GAME STATE ----------------
 const rooms = {};
