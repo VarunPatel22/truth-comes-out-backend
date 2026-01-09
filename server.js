@@ -25,13 +25,14 @@ const io = new Server(server, {
   cors: { origin: "*" }
 });
 
-// Debug endpoints (temporary - helpful in dev)
+// Debug endpoints (dev)
 app.get('/_debug/status', (req, res) => {
   res.json({
     server: 'ok',
-    firebase: !!(typeof admin !== 'undefined' && admin.apps && admin.apps.length > 0),
+    firebaseInitialized: !!(admin.apps && admin.apps.length > 0),
     port: process.env.PORT || 3000,
-    connectedSockets: io.sockets ? io.sockets.sockets.size : 0
+    connectedSockets: io.sockets ? io.sockets.sockets.size : 0,
+    firebaseProjectIdEnv: process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || null
   });
 });
 
@@ -45,75 +46,99 @@ app.get('/_debug/clients', (req, res) => {
   res.json({ count: sockets.length, sockets });
 });
 
-// ---------------- FIREBASE INIT (robust) ----------------
+// ---------------- FIREBASE INIT (robust + project id handling) ----------------
 let db = null;
+
 async function initFirebase() {
   const firebaseKeyEnv = process.env.FIREBASE_KEY || "";
   const firebaseKeyPathEnv = process.env.FIREBASE_KEY_PATH || process.env.GOOGLE_APPLICATION_CREDENTIALS || "";
+  const explicitProjectId = process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || "";
 
+  // If emulator set, log it
   if (process.env.FIRESTORE_EMULATOR_HOST) {
     console.log("🔁 Using Firestore emulator at", process.env.FIRESTORE_EMULATOR_HOST);
   }
 
-  try {
-    if (firebaseKeyEnv && firebaseKeyEnv.trim().length > 0) {
-      try {
-        const serviceAccount = JSON.parse(firebaseKeyEnv);
-        admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount)
-        });
-        db = admin.firestore();
-        console.log("✅ Firebase connected (from FIREBASE_KEY env var)");
-        return;
-      } catch (err) {
-        console.error("❌ Failed to parse FIREBASE_KEY env JSON:", err.message);
-      }
-    }
-
-    if (firebaseKeyPathEnv && firebaseKeyPathEnv.trim().length > 0) {
-      const resolvedPath = path.resolve(firebaseKeyPathEnv);
-      if (fs.existsSync(resolvedPath)) {
-        try {
-          const serviceAccount = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
-          admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-          });
-          db = admin.firestore();
-          console.log(`✅ Firebase connected (from FIREBASE_KEY_PATH: ${resolvedPath})`);
-          return;
-        } catch (err) {
-          console.error("❌ Failed to initialize Firebase from file:", resolvedPath, err.message);
-        }
-      } else {
-        console.warn(`⚠ FIREBASE_KEY_PATH file not found at: ${resolvedPath}`);
-      }
-    }
-
-    // Try ADC
+  // Helper to init by serviceAccount object
+  function initWithServiceAccount(serviceAccount) {
+    const projectId = serviceAccount.project_id || explicitProjectId || null;
+    const initOptions = {};
+    if (projectId) initOptions.projectId = projectId;
     try {
-      admin.initializeApp();
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        ...(projectId ? { projectId } : {})
+      });
       db = admin.firestore();
-      console.log("✅ Firebase initialized with Application Default Credentials");
-      return;
+      if (projectId) console.log(`✅ Firebase connected (service account) — projectId: ${projectId}`);
+      else console.log("✅ Firebase connected (service account) — projectId not explicitly set (may fail for Firestore ops)");
+      return true;
+    } catch (e) {
+      console.error("❌ admin.initializeApp(serviceAccount) failed:", e.message);
+      return false;
+    }
+  }
+
+  // 1) FIREBASE_KEY JSON string
+  if (firebaseKeyEnv && firebaseKeyEnv.trim().length > 0) {
+    try {
+      const serviceAccount = JSON.parse(firebaseKeyEnv);
+      if (initWithServiceAccount(serviceAccount)) return;
     } catch (err) {
-      console.warn("⚠ Firebase ADC init failed:", err.message);
+      console.error("❌ Failed to parse FIREBASE_KEY JSON:", err.message);
+    }
+  }
+
+  // 2) FIREBASE_KEY_PATH file
+  if (firebaseKeyPathEnv && firebaseKeyPathEnv.trim().length > 0) {
+    const resolvedPath = path.resolve(firebaseKeyPathEnv);
+    if (fs.existsSync(resolvedPath)) {
+      try {
+        const serviceAccount = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+        if (initWithServiceAccount(serviceAccount)) return;
+      } catch (err) {
+        console.error("❌ Failed to initialize Firebase from file:", resolvedPath, err.message);
+      }
+    } else {
+      console.warn(`⚠ FIREBASE_KEY_PATH not found: ${resolvedPath}`);
+    }
+  }
+
+  // 3) Try Application Default Credentials (ADC)
+  try {
+    // If explicit project id env present, use it for Firestore
+    if (explicitProjectId) {
+      admin.initializeApp({ projectId: explicitProjectId });
+      db = admin.firestore();
+      console.log("✅ Firebase initialized with Application Default Credentials and explicit projectId:", explicitProjectId);
+      return;
     }
 
-    console.log("⚠ Firebase disabled — no valid credentials found. To enable, set FIREBASE_KEY (JSON) or FIREBASE_KEY_PATH (file).");
-  } catch (e) {
-    console.error("❌ Unexpected Firebase initialization error:", e);
+    // Otherwise try plain ADC
+    admin.initializeApp();
+    db = admin.firestore();
+    console.log("✅ Firebase initialized with Application Default Credentials (projectId auto-detected if available)");
+    return;
+  } catch (err) {
+    console.warn("⚠ Firebase ADC init failed:", err.message);
   }
+
+  // All attempts failed: show helpful guidance
+  console.log("⚠ Firebase not initialized. Provide credentials via:");
+  console.log("   - FIREBASE_KEY (JSON string)  OR");
+  console.log("   - FIREBASE_KEY_PATH (path to service account JSON)  OR");
+  console.log("   - Set GOOGLE_APPLICATION_CREDENTIALS and ensure project id is available via FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT.");
+  console.log("See https://firebase.google.com/docs/admin/setup for details.");
 }
 
-// Initialize Firebase before socket logic
 await initFirebase();
 
-// Optional emulator settings
+// If we still have db and emulator, apply optional settings
 if (db && process.env.FIRESTORE_EMULATOR_HOST) {
   try {
-    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const projectId = process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || null;
     if (projectId) db.settings({ projectId });
-    console.log("🔧 Firestore settings applied for emulator (if any)");
+    console.log("🔧 Applied Firestore emulator settings (if any)");
   } catch (e) {
     console.warn("⚠ Failed to apply Firestore emulator settings:", e.message);
   }
@@ -126,6 +151,7 @@ function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+// Helper to broadcast name->score mapping
 function emitScores(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
@@ -180,6 +206,7 @@ io.on("connection", socket => {
     emitScores(roomCode);
   });
 
+
   socket.on("join-room", ({ roomCode, name, avatar }) => {
     const room = rooms[roomCode];
     if (!room) return;
@@ -198,6 +225,7 @@ io.on("connection", socket => {
     // update scores for everyone
     emitScores(roomCode);
   });
+
 
   socket.on("set-rounds", ({ roomCode, rounds }) => {
     if (rooms[roomCode]?.host === socket.id) {
@@ -220,7 +248,7 @@ io.on("connection", socket => {
     room.voteStarted = false;
     room.answers = [];
     room.submitted.clear();
-    room.votes = {};
+    room.votes = {}; // reset votes for this round
 
     let questionText = "Say something funny 😄";
 
@@ -236,10 +264,19 @@ io.on("connection", socket => {
         }
       } catch (e) {
         console.warn("⚠ Error fetching questions from Firestore:", e.message);
+        // If Firestore complains about missing project id, print targeted guidance:
+        if (e.message && e.message.includes("Unable to detect a Project Id")) {
+          console.warn("→ Firestore error: Project ID not detected. Set FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT environment variable, or provide a service account via FIREBASE_KEY_PATH / FIREBASE_KEY.");
+        }
       }
+    } else {
+      // DB disabled - still run using default static question
+      // questionText remains the default
     }
 
     io.to(roomCode).emit("new-question", { text: questionText });
+
+    // Emit current scores immediately so clients can display live scoreboard
     emitScores(roomCode);
 
     clearTimeout(room.timer);
@@ -275,6 +312,7 @@ io.on("connection", socket => {
     console.log("🗳 Entering vote phase", roomCode);
 
     room.votes = {};
+
     io.to(roomCode).emit("phase-vote", room.answers);
     emitScores(roomCode);
   }
