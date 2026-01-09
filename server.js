@@ -22,7 +22,10 @@ app.get('/', (req, res) => res.send('Socket server running'));
 // ---------------- HTTP + SOCKET.IO ----------------
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
 });
 
 // Debug endpoints (dev)
@@ -46,8 +49,6 @@ app.get('/_debug/clients', (req, res) => {
   res.json({ count: sockets.length, sockets });
 });
 
-// ---------------- FIREBASE INIT (robust + project id handling) ----------------
-// ---------------- FIREBASE INIT (ENV BASED) ----------------
 // ---------------- FIREBASE INIT (ENV BASED) ----------------
 let db = null;
 
@@ -64,17 +65,16 @@ try {
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-    })
+      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    }),
   });
 
   db = admin.firestore();
-  console.log("✅ Firebase connected using ENV credentials");
+  console.log("��� Firebase connected using ENV credentials");
 
 } catch (err) {
   console.error("❌ Firebase init failed:", err.message);
 }
-
 
 // ---------------- GAME STATE ----------------
 const rooms = {};
@@ -196,14 +196,10 @@ io.on("connection", socket => {
         }
       } catch (e) {
         console.warn("⚠ Error fetching questions from Firestore:", e.message);
-        // If Firestore complains about missing project id, print targeted guidance:
         if (e.message && e.message.includes("Unable to detect a Project Id")) {
-          console.warn("→ Firestore error: Project ID not detected. Set FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT environment variable, or provide a service account via FIREBASE_KEY_PATH / FIREBASE_KEY.");
+          console.warn("→ Firestore error: Project ID not detected. Set FIREBASE_PROJECT_ID or provide proper service account.");
         }
       }
-    } else {
-      // DB disabled - still run using default static question
-      // questionText remains the default
     }
 
     io.to(roomCode).emit("new-question", { text: questionText });
