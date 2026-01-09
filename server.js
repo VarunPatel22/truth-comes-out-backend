@@ -5,6 +5,7 @@ import cors from "cors";
 import { Server } from "socket.io";
 import admin from "firebase-admin";
 import path from "path";
+import fs from "fs";
 
 // ---------------- BASIC SETUP ----------------
 const app = express();
@@ -15,21 +16,107 @@ app.use(express.json());
 app.use('/icons', express.static(path.join(process.cwd(), 'public', 'icons')));
 app.use('/icons', express.static(path.join(process.cwd(), 'frontend', 'icons')));
 
+// Health route
+app.get('/', (req, res) => res.send('Socket server running'));
+
+// ---------------- HTTP + SOCKET.IO ----------------
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" }
 });
 
-// ---------------- FIREBASE INIT ----------------
-let db = null;
-try {
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY))
+// Debug endpoints (temporary - helpful in dev)
+app.get('/_debug/status', (req, res) => {
+  res.json({
+    server: 'ok',
+    firebase: !!(typeof admin !== 'undefined' && admin.apps && admin.apps.length > 0),
+    port: process.env.PORT || 3000,
+    connectedSockets: io.sockets ? io.sockets.sockets.size : 0
   });
-  db = admin.firestore();
-  console.log("✅ Firebase connected");
-} catch (e) {
-  console.log("⚠ Firebase disabled");
+});
+
+app.get('/_debug/clients', (req, res) => {
+  const sockets = [];
+  if (io.sockets && io.sockets.sockets) {
+    io.sockets.sockets.forEach((s) => {
+      sockets.push({ id: s.id, rooms: Array.from(s.rooms || []) });
+    });
+  }
+  res.json({ count: sockets.length, sockets });
+});
+
+// ---------------- FIREBASE INIT (robust) ----------------
+let db = null;
+async function initFirebase() {
+  const firebaseKeyEnv = process.env.FIREBASE_KEY || "";
+  const firebaseKeyPathEnv = process.env.FIREBASE_KEY_PATH || process.env.GOOGLE_APPLICATION_CREDENTIALS || "";
+
+  if (process.env.FIRESTORE_EMULATOR_HOST) {
+    console.log("🔁 Using Firestore emulator at", process.env.FIRESTORE_EMULATOR_HOST);
+  }
+
+  try {
+    if (firebaseKeyEnv && firebaseKeyEnv.trim().length > 0) {
+      try {
+        const serviceAccount = JSON.parse(firebaseKeyEnv);
+        admin.initializeApp({
+          credential: admin.credential.cert(serviceAccount)
+        });
+        db = admin.firestore();
+        console.log("✅ Firebase connected (from FIREBASE_KEY env var)");
+        return;
+      } catch (err) {
+        console.error("❌ Failed to parse FIREBASE_KEY env JSON:", err.message);
+      }
+    }
+
+    if (firebaseKeyPathEnv && firebaseKeyPathEnv.trim().length > 0) {
+      const resolvedPath = path.resolve(firebaseKeyPathEnv);
+      if (fs.existsSync(resolvedPath)) {
+        try {
+          const serviceAccount = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+          admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+          });
+          db = admin.firestore();
+          console.log(`✅ Firebase connected (from FIREBASE_KEY_PATH: ${resolvedPath})`);
+          return;
+        } catch (err) {
+          console.error("❌ Failed to initialize Firebase from file:", resolvedPath, err.message);
+        }
+      } else {
+        console.warn(`⚠ FIREBASE_KEY_PATH file not found at: ${resolvedPath}`);
+      }
+    }
+
+    // Try ADC
+    try {
+      admin.initializeApp();
+      db = admin.firestore();
+      console.log("✅ Firebase initialized with Application Default Credentials");
+      return;
+    } catch (err) {
+      console.warn("⚠ Firebase ADC init failed:", err.message);
+    }
+
+    console.log("⚠ Firebase disabled — no valid credentials found. To enable, set FIREBASE_KEY (JSON) or FIREBASE_KEY_PATH (file).");
+  } catch (e) {
+    console.error("❌ Unexpected Firebase initialization error:", e);
+  }
+}
+
+// Initialize Firebase before socket logic
+await initFirebase();
+
+// Optional emulator settings
+if (db && process.env.FIRESTORE_EMULATOR_HOST) {
+  try {
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    if (projectId) db.settings({ projectId });
+    console.log("🔧 Firestore settings applied for emulator (if any)");
+  } catch (e) {
+    console.warn("⚠ Failed to apply Firestore emulator settings:", e.message);
+  }
 }
 
 // ---------------- GAME STATE ----------------
@@ -39,7 +126,6 @@ function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-// Helper to broadcast name->score mapping
 function emitScores(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
@@ -54,6 +140,7 @@ function emitScores(roomCode) {
 
 // ---------------- SOCKET LOGIC ----------------
 io.on("connection", socket => {
+  console.log("🔌 client connected", socket.id);
 
   socket.on("create-room", ({ name, avatar }) => {
     const roomCode = generateRoomCode();
@@ -93,7 +180,6 @@ io.on("connection", socket => {
     emitScores(roomCode);
   });
 
-
   socket.on("join-room", ({ roomCode, name, avatar }) => {
     const room = rooms[roomCode];
     if (!room) return;
@@ -113,17 +199,14 @@ io.on("connection", socket => {
     emitScores(roomCode);
   });
 
-
   socket.on("set-rounds", ({ roomCode, rounds }) => {
     if (rooms[roomCode]?.host === socket.id) {
       rooms[roomCode].maxRounds = rounds;
-      // broadcast the updated rounds value (optional for client UI if needed)
       io.to(roomCode).emit("rounds-updated", { maxRounds: rounds });
     }
   });
 
   socket.on("start-game", roomCode => {
-    // Only allow host to actually start the game
     if (rooms[roomCode]?.host !== socket.id) return;
     rooms[roomCode].round = 0;
     startRound(roomCode);
@@ -137,24 +220,26 @@ io.on("connection", socket => {
     room.voteStarted = false;
     room.answers = [];
     room.submitted.clear();
-    room.votes = {}; // reset votes for this round
+    room.votes = {};
 
     let questionText = "Say something funny 😄";
 
     if (db) {
-      const snap = await db.collection("questions").get();
-      const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
-      if (valid.length) {
-        const q = valid[Math.floor(Math.random() * valid.length)];
-        const names = Object.values(room.players).map(p => p.name);
-        const randomName = names[Math.floor(Math.random() * names.length)];
-        questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
+      try {
+        const snap = await db.collection("questions").get();
+        const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
+        if (valid.length) {
+          const q = valid[Math.floor(Math.random() * valid.length)];
+          const names = Object.values(room.players).map(p => p.name);
+          const randomName = names[Math.floor(Math.random() * names.length)];
+          questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
+        }
+      } catch (e) {
+        console.warn("⚠ Error fetching questions from Firestore:", e.message);
       }
     }
 
     io.to(roomCode).emit("new-question", { text: questionText });
-
-    // Emit current scores immediately so clients can display live scoreboard
     emitScores(roomCode);
 
     clearTimeout(room.timer);
@@ -189,47 +274,31 @@ io.on("connection", socket => {
 
     console.log("🗳 Entering vote phase", roomCode);
 
-    // ensure votes object exists for this round
     room.votes = {};
-
     io.to(roomCode).emit("phase-vote", room.answers);
-    // Also send current scores to clients
     emitScores(roomCode);
   }
 
   socket.on("vote", ({ roomCode, votedFor }) => {
     const room = rooms[roomCode];
     if (!room || room.phase !== "vote") return;
-
-    // Prevent multiple votes from same socket this round
     if (room.votes[socket.id]) return;
-
-    // Prevent voting for yourself (defensive)
     if (votedFor === socket.id) return;
 
-    // record the vote
     room.votes[socket.id] = votedFor;
-
-    // increment score immediately so players see points as votes arrive
     if (room.scores[votedFor] !== undefined) {
       room.scores[votedFor]++;
     }
-
-    // broadcast updated scores to all clients
     emitScores(roomCode);
 
-    // Check if all players have voted (one vote per player)
     const totalPlayers = Object.keys(room.players).length;
     const votesCount = Object.keys(room.votes).length;
 
     if (votesCount >= totalPlayers) {
-      // All votes in: advance round (or end game).
       room.round++;
       if (room.round >= room.maxRounds) {
-        // small delay so clients can see final votes/score
         setTimeout(() => endGame(roomCode), 2000);
       } else {
-        // delay a moment to show scores to players before starting next round
         setTimeout(() => startRound(roomCode), 2000);
       }
     }
@@ -246,31 +315,27 @@ io.on("connection", socket => {
     io.to(roomCode).emit("game-over", scores);
   }
 
-  // handle disconnect: remove player and notify room (basic)
   socket.on("disconnect", () => {
-    // find any room containing this socket
     Object.keys(rooms).forEach(rc => {
       const room = rooms[rc];
       if (room.players[socket.id]) {
         delete room.players[socket.id];
         delete room.scores[socket.id];
-        // If host left, optionally reassign host to another player
         if (room.host === socket.id) {
           const remaining = Object.keys(room.players);
           room.host = remaining.length ? remaining[0] : null;
         }
-        // emit updated player list as array of { name, avatar } and host id
         io.to(rc).emit("player-update", {
           players: Object.values(room.players),
           host: room.host
         });
-        // update scores as well
         emitScores(rc);
       }
     });
+    console.log("🔌 client disconnected", socket.id);
   });
 });
 
 server.listen(process.env.PORT || 3000, () =>
-  console.log("🚀 Server running")
+  console.log("🚀 Server running on port", process.env.PORT || 3000)
 );
