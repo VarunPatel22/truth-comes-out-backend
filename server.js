@@ -92,8 +92,7 @@ const FALLBACK_QUESTIONS = [
 ];
 
 // ---------------- SOCKET LOGIC ----------------
-io.on("connection", socket => {
-  console.log("🔌 client connected", socket.id);
+
 
   socket.on("create-room", ({ name, avatar }) => {
     const roomCode = generateRoomCode();
@@ -162,155 +161,62 @@ io.on("connection", socket => {
     startRound(roomCode);
   });
 
-  async function startRound(roomCode) {
-    const room = rooms[roomCode];
-    if (!room) return;
+async function startRound(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
 
-    room.phase = "answer";
-    room.voteStarted = false;
-    room.answers = [];
-    room.submitted.clear();
-    room.votes = {};
+  room.phase = "answer";
+  room.voteStarted = false;
+  room.answers = [];
+  room.submitted.clear();
+  room.votes = {};
 
-    let questionText = FALLBACK_QUESTIONS[0];
+  let questionText =
+    FALLBACK_QUESTIONS[Math.floor(Math.random() * FALLBACK_QUESTIONS.length)];
 
-    // Attempt to fetch only active questions from Firestore
-    if (db) {
-      try {
-        console.log("📡 Fetching questions from Firestore...");
-        const snap = await db.collection("questions")
-                             .where("active", "==", true)
-                             .orderBy("createdAt", "desc")
-                             .get();
+  if (db) {
+    try {
+      console.log("📡 Fetching questions from Firestore...");
+      const snap = await db.collection("questions")
+        .where("active", "==", true)
+        .get();
 
-        const docs = snap.docs || [];
-        console.log(`📄 Firestore returned ${docs.length} docs`);
+      const valid = snap.docs
+        .map(d => d.data())
+        .filter(q => typeof q.text === "string" && q.text.trim().length > 0);
 
-        const valid = docs
-          .map(d => ({ id: d.id, ...d.data() }))
-          .filter(q => q && q.text && q.text.toString().trim().length > 0);
+      console.log(`📄 Firestore returned ${valid.length} valid questions`);
 
-        if (valid.length) {
-          // pick a random entry to avoid repeating same order
-          const idx = Math.floor(Math.random() * valid.length);
-          const q = valid[idx];
-          const names = Object.values(room.players).map(p => p.name);
-          const randomName = names.length ? names[Math.floor(Math.random() * names.length)] : 'friend';
+      if (valid.length > 0) {
+        const q = valid[Math.floor(Math.random() * valid.length)];
+
+        const names = Object.values(room.players).map(p => p.name);
+        const randomName = names.length
+          ? names[Math.floor(Math.random() * names.length)]
+          : "friend";
+
+        if (q.text.includes("{{name}}")) {
           questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
-          console.log(`✅ Selected question id=${q.id}`);
         } else {
-          console.log("⚠ No valid questions found in Firestore (active/text). Falling back to defaults.");
-          // fall back to random fallback question
-          questionText = FALLBACK_QUESTIONS[Math.floor(Math.random() * FALLBACK_QUESTIONS.length)];
+          questionText = `About ${randomName}: ${q.text}`;
         }
-      } catch (e) {
-        console.warn("⚠ Error fetching questions from Firestore:", e.message || e);
-        questionText = FALLBACK_QUESTIONS[Math.floor(Math.random() * FALLBACK_QUESTIONS.length)];
-      }
-    } else {
-      console.log("⚠ Firestore not initialized — using fallback questions.");
-      questionText = FALLBACK_QUESTIONS[Math.floor(Math.random() * FALLBACK_QUESTIONS.length)];
-    }
 
-    io.to(roomCode).emit("new-question", { text: questionText });
-
-    emitScores(roomCode);
-
-    clearTimeout(room.timer);
-    room.timer = setTimeout(() => forceVote(roomCode), 60000);
-  }
-
-  socket.on("submit-answer", ({ roomCode, answer }) => {
-    const room = rooms[roomCode];
-    if (!room || room.phase !== "answer") return;
-    if (room.submitted.has(socket.id)) return;
-
-    room.submitted.add(socket.id);
-    room.answers.push({ author: socket.id, text: answer || "🤡" });
-
-    io.to(roomCode).emit("submission-update", {
-      submitted: room.submitted.size,
-      total: Object.keys(room.players).length
-    });
-
-    if (room.submitted.size === Object.keys(room.players).length) {
-      forceVote(roomCode);
-    }
-  });
-
-  function forceVote(roomCode) {
-    const room = rooms[roomCode];
-    if (!room || room.voteStarted) return;
-
-    room.voteStarted = true;
-    room.phase = "vote";
-    clearTimeout(room.timer);
-
-    console.log("🗳 Entering vote phase", roomCode);
-
-    room.votes = {};
-
-    io.to(roomCode).emit("phase-vote", room.answers);
-    emitScores(roomCode);
-  }
-
-  socket.on("vote", ({ roomCode, votedFor }) => {
-    const room = rooms[roomCode];
-    if (!room || room.phase !== "vote") return;
-    if (room.votes[socket.id]) return;
-    if (votedFor === socket.id) return;
-
-    room.votes[socket.id] = votedFor;
-    if (room.scores[votedFor] !== undefined) {
-      room.scores[votedFor]++;
-    }
-    emitScores(roomCode);
-
-    const totalPlayers = Object.keys(room.players).length;
-    const votesCount = Object.keys(room.votes).length;
-
-    if (votesCount >= totalPlayers) {
-      room.round++;
-      if (room.round >= room.maxRounds) {
-        setTimeout(() => endGame(roomCode), 2000);
+        console.log("✅ Selected Firestore question:", questionText);
       } else {
-        setTimeout(() => startRound(roomCode), 2000);
+        console.log("⚠ No valid Firestore questions. Using fallback.");
       }
+    } catch (e) {
+      console.warn("⚠ Firestore error:", e.message);
     }
-  });
-
-  function endGame(roomCode) {
-    const room = rooms[roomCode];
-    if (!room) return;
-    const scores = {};
-    Object.keys(room.players).forEach(id => {
-      const displayName = room.players[id].name;
-      scores[displayName] = room.scores[id];
-    });
-    io.to(roomCode).emit("game-over", scores);
   }
 
-  socket.on("disconnect", () => {
-    Object.keys(rooms).forEach(rc => {
-      const room = rooms[rc];
-      if (room.players[socket.id]) {
-        delete room.players[socket.id];
-        delete room.scores[socket.id];
-        if (room.host === socket.id) {
-          const remaining = Object.keys(room.players);
-          room.host = remaining.length ? remaining[0] : null;
-        }
-        io.to(rc).emit("player-update", {
-          players: Object.values(room.players),
-          host: room.host
-        });
-        emitScores(rc);
-      }
-    });
-    console.log("🔌 client disconnected", socket.id);
-  });
+  io.to(roomCode).emit("new-question", { text: questionText });
+  emitScores(roomCode);
 
-});
+  clearTimeout(room.timer);
+  room.timer = setTimeout(() => forceVote(roomCode), 60000);
+}
+
 
 // ---------- ADMIN ROUTES ----------
 app.get("/admin/questions", adminAuth, async (req, res) => {
@@ -333,7 +239,8 @@ app.post("/admin/questions", adminAuth, async (req, res) => {
     const doc = await db.collection("questions").add({
       text,
       active: true,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
+     createdAt: Date.now()
+
     });
 
     res.json({ success: true, id: doc.id });
@@ -355,9 +262,21 @@ app.delete("/admin/questions/:id", adminAuth, async (req, res) => {
 // Protected debug route to inspect what server sees (admin key required)
 app.get("/_debug/questions", adminAuth, async (req, res) => {
   try {
-    if (!db) return res.status(503).json({ error: "Database not initialized" });
-    const snap = await db.collection("questions").orderBy("createdAt", "desc").get();
-    res.json({ count: snap.size, docs: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+    if (!db) return res.status(503).json({ error: "DB not ready" });
+
+    const snap = await db.collection("questions")
+      .where("active", "==", true)
+      .get();
+
+    const valid = snap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .filter(q => typeof q.text === "string" && q.text.trim().length > 0);
+
+    res.json({
+      total: snap.size,
+      validCount: valid.length,
+      questions: valid
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
