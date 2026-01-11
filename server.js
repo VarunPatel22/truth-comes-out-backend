@@ -12,10 +12,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Serve static 'public' so admin.html can be placed in ./public/admin.html
-app.use(express.static(path.join(process.cwd(), 'public')));
-
-// Serve static assets (icons)
+// Serve static assets (both public/icons and frontend/icons supported)
 app.use('/icons', express.static(path.join(process.cwd(), 'public', 'icons')));
 app.use('/icons', express.static(path.join(process.cwd(), 'frontend', 'icons')));
 
@@ -25,10 +22,7 @@ app.get('/', (req, res) => res.send('Socket server running'));
 // ---------------- HTTP + SOCKET.IO ----------------
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*" }
 });
 
 // Debug endpoints (dev)
@@ -52,40 +46,102 @@ app.get('/_debug/clients', (req, res) => {
   res.json({ count: sockets.length, sockets });
 });
 
-// ---------------- FIREBASE INIT (ENV BASED) ----------------
+// ---------------- FIREBASE INIT (robust + project id handling) ----------------
 let db = null;
 
-try {
-  if (
-    !process.env.FIREBASE_PROJECT_ID ||
-    !process.env.FIREBASE_CLIENT_EMAIL ||
-    !process.env.FIREBASE_PRIVATE_KEY
-  ) {
-    throw new Error("Missing Firebase ENV variables");
+async function initFirebase() {
+  const firebaseKeyEnv = process.env.FIREBASE_KEY || "";
+  const firebaseKeyPathEnv = process.env.FIREBASE_KEY_PATH || process.env.GOOGLE_APPLICATION_CREDENTIALS || "";
+  const explicitProjectId = process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || "";
+
+  // If emulator set, log it
+  if (process.env.FIRESTORE_EMULATOR_HOST) {
+    console.log("🔁 Using Firestore emulator at", process.env.FIRESTORE_EMULATOR_HOST);
   }
 
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    }),
-  });
+  // Helper to init by serviceAccount object
+  function initWithServiceAccount(serviceAccount) {
+    const projectId = serviceAccount.project_id || explicitProjectId || null;
+    const initOptions = {};
+    if (projectId) initOptions.projectId = projectId;
+    try {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        ...(projectId ? { projectId } : {})
+      });
+      db = admin.firestore();
+      if (projectId) console.log(`✅ Firebase connected (service account) — projectId: ${projectId}`);
+      else console.log("✅ Firebase connected (service account) — projectId not explicitly set (may fail for Firestore ops)");
+      return true;
+    } catch (e) {
+      console.error("❌ admin.initializeApp(serviceAccount) failed:", e.message);
+      return false;
+    }
+  }
 
-  db = admin.firestore();
-  console.log("✅ Firebase connected using ENV credentials");
+  // 1) FIREBASE_KEY JSON string
+  if (firebaseKeyEnv && firebaseKeyEnv.trim().length > 0) {
+    try {
+      const serviceAccount = JSON.parse(firebaseKeyEnv);
+      if (initWithServiceAccount(serviceAccount)) return;
+    } catch (err) {
+      console.error("❌ Failed to parse FIREBASE_KEY JSON:", err.message);
+    }
+  }
 
-} catch (err) {
-  console.error("❌ Firebase init failed:", err.message);
+  // 2) FIREBASE_KEY_PATH file
+  if (firebaseKeyPathEnv && firebaseKeyPathEnv.trim().length > 0) {
+    const resolvedPath = path.resolve(firebaseKeyPathEnv);
+    if (fs.existsSync(resolvedPath)) {
+      try {
+        const serviceAccount = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+        if (initWithServiceAccount(serviceAccount)) return;
+      } catch (err) {
+        console.error("❌ Failed to initialize Firebase from file:", resolvedPath, err.message);
+      }
+    } else {
+      console.warn(`⚠ FIREBASE_KEY_PATH not found: ${resolvedPath}`);
+    }
+  }
+
+  // 3) Try Application Default Credentials (ADC)
+  try {
+    // If explicit project id env present, use it for Firestore
+    if (explicitProjectId) {
+      admin.initializeApp({ projectId: explicitProjectId });
+      db = admin.firestore();
+      console.log("✅ Firebase initialized with Application Default Credentials and explicit projectId:", explicitProjectId);
+      return;
+    }
+
+    // Otherwise try plain ADC
+    admin.initializeApp();
+    db = admin.firestore();
+    console.log("✅ Firebase initialized with Application Default Credentials (projectId auto-detected if available)");
+    return;
+  } catch (err) {
+    console.warn("⚠ Firebase ADC init failed:", err.message);
+  }
+
+  // All attempts failed: show helpful guidance
+  console.log("⚠ Firebase not initialized. Provide credentials via:");
+  console.log("   - FIREBASE_KEY (JSON string)  OR");
+  console.log("   - FIREBASE_KEY_PATH (path to service account JSON)  OR");
+  console.log("   - Set GOOGLE_APPLICATION_CREDENTIALS and ensure project id is available via FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT.");
+  console.log("See https://firebase.google.com/docs/admin/setup for details.");
 }
 
-// ---------- ADMIN AUTH MIDDLEWARE ----------
-function adminAuth(req, res, next) {
-  const key = req.headers["x-admin-key"];
-  if (!key || key !== process.env.ADMIN_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
+await initFirebase();
+
+// If we still have db and emulator, apply optional settings
+if (db && process.env.FIRESTORE_EMULATOR_HOST) {
+  try {
+    const projectId = process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || null;
+    if (projectId) db.settings({ projectId });
+    console.log("🔧 Applied Firestore emulator settings (if any)");
+  } catch (e) {
+    console.warn("⚠ Failed to apply Firestore emulator settings:", e.message);
   }
-  next();
 }
 
 // ---------------- GAME STATE ----------------
@@ -208,10 +264,14 @@ io.on("connection", socket => {
         }
       } catch (e) {
         console.warn("⚠ Error fetching questions from Firestore:", e.message);
+        // If Firestore complains about missing project id, print targeted guidance:
         if (e.message && e.message.includes("Unable to detect a Project Id")) {
-          console.warn("→ Firestore error: Project ID not detected. Set FIREBASE_PROJECT_ID or provide proper service account.");
+          console.warn("→ Firestore error: Project ID not detected. Set FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT environment variable, or provide a service account via FIREBASE_KEY_PATH / FIREBASE_KEY.");
         }
       }
+    } else {
+      // DB disabled - still run using default static question
+      // questionText remains the default
     }
 
     io.to(roomCode).emit("new-question", { text: questionText });
@@ -312,49 +372,6 @@ io.on("connection", socket => {
     });
     console.log("🔌 client disconnected", socket.id);
   });
-});
-// ---------- ADMIN ROUTES ----------
-
-app.get("/admin/questions", adminAuth, async (req, res) => {
-  try {
-    if (!db) return res.status(503).json({ error: "Database not initialized" });
-    const snap = await db.collection("questions").orderBy("createdAt", "desc").get();
-    const questions = snap.docs.map(d => ({
-      id: d.id,
-      ...d.data()
-    }));
-    res.json(questions);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/admin/questions", adminAuth, async (req, res) => {
-  try {
-    if (!db) return res.status(503).json({ error: "Database not initialized" });
-    const { text } = req.body;
-    if (!text) return res.status(400).json({ error: "Question text required" });
-
-    const doc = await db.collection("questions").add({
-      text,
-      active: true,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    res.json({ success: true, id: doc.id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete("/admin/questions/:id", adminAuth, async (req, res) => {
-  try {
-    if (!db) return res.status(503).json({ error: "Database not initialized" });
-    await db.collection("questions").doc(req.params.id).delete();
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
 });
 
 server.listen(process.env.PORT || 3000, () =>
