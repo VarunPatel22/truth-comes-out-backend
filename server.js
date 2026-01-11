@@ -22,6 +22,8 @@ app.use('/icons', express.static(path.join(process.cwd(), 'frontend', 'icons')))
 // Health route
 app.get('/', (req, res) => res.send('Socket server running'));
 
+
+
 // ---------------- HTTP + SOCKET.IO ----------------
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -79,6 +81,14 @@ try {
   console.error("❌ Firebase init failed:", err.message);
 }
 
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 // ---------- ADMIN AUTH MIDDLEWARE ----------
 function adminAuth(req, res, next) {
   const key = req.headers["x-admin-key"];
@@ -121,6 +131,10 @@ io.on("connection", socket => {
         [socket.id]: { name: name || "Host", avatar: avatar || "/icons/icon-1.jpg" }
       },
       scores: { [socket.id]: 0 },
+
+      nameQueue: [],
+      usedNames: [],
+
       answers: [],
       submitted: new Set(),
       phase: "lobby",
@@ -157,6 +171,14 @@ io.on("connection", socket => {
 
     room.players[socket.id] = { name: name || "Player", avatar: avatar || "/icons/icon-1.jpg" };
     room.scores[socket.id] = 0;
+
+    room.players[socket.id] = { name, avatar };
+room.scores[socket.id] = 0;
+
+// reset name queue so new player gets included
+room.nameQueue = [];
+room.usedNames = [];
+
 
     socket.join(roomCode);
 
@@ -201,9 +223,20 @@ io.on("connection", socket => {
         const snap = await db.collection("questions").get();
         const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
         if (valid.length) {
-          const q = valid[Math.floor(Math.random() * valid.length)];
-          const names = Object.values(room.players).map(p => p.name);
-          const randomName = names[Math.floor(Math.random() * names.length)];
+         const q = valid[Math.floor(Math.random() * valid.length)];
+
+let questionText;
+if (q.text.includes("{{name}}")) {
+  questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
+} else {
+  questionText = `About ${randomName}: ${q.text}`;
+}
+
+
+// Pick next name fairly
+const randomName = room.nameQueue.shift();
+room.usedNames.push(randomName);
+
           questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
         }
       } catch (e) {
