@@ -12,10 +12,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Serve static 'public' for admin page if present
+// Serve static 'public' so admin.html can be placed in ./public/admin.html
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-// Serve icons
+// Serve static assets (icons)
 app.use('/icons', express.static(path.join(process.cwd(), 'public', 'icons')));
 app.use('/icons', express.static(path.join(process.cwd(), 'frontend', 'icons')));
 
@@ -25,11 +25,36 @@ app.get('/', (req, res) => res.send('Socket server running'));
 // ---------------- HTTP + SOCKET.IO ----------------
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// Debug endpoints (dev)
+app.get('/_debug/status', (req, res) => {
+  res.json({
+    server: 'ok',
+    firebaseInitialized: !!(admin.apps && admin.apps.length > 0),
+    port: process.env.PORT || 3000,
+    connectedSockets: io.sockets ? io.sockets.sockets.size : 0,
+    firebaseProjectIdEnv: process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || null
+  });
+});
+
+app.get('/_debug/clients', (req, res) => {
+  const sockets = [];
+  if (io.sockets && io.sockets.sockets) {
+    io.sockets.sockets.forEach((s) => {
+      sockets.push({ id: s.id, rooms: Array.from(s.rooms || []) });
+    });
+  }
+  res.json({ count: sockets.length, sockets });
 });
 
 // ---------------- FIREBASE INIT (ENV BASED) ----------------
 let db = null;
+
 try {
   if (
     !process.env.FIREBASE_PROJECT_ID ||
@@ -49,8 +74,8 @@ try {
 
   db = admin.firestore();
   console.log("✅ Firebase connected using ENV credentials");
+
 } catch (err) {
-  db = null;
   console.error("❌ Firebase init failed:", err.message);
 }
 
@@ -83,16 +108,9 @@ function emitScores(roomCode) {
   io.to(roomCode).emit("scores-update", mapping);
 }
 
-// Small internal fallback questions if Firestore is empty / unavailable
-const FALLBACK_QUESTIONS = [
-  "Say something funny 😄",
-  "What's your most embarrassing moment?",
-  "Share a weird habit you have",
-  "Describe your dream vacation in one sentence"
-];
-
 // ---------------- SOCKET LOGIC ----------------
-
+io.on("connection", socket => {
+  console.log("🔌 client connected", socket.id);
 
   socket.on("create-room", ({ name, avatar }) => {
     const roomCode = generateRoomCode();
@@ -115,17 +133,20 @@ const FALLBACK_QUESTIONS = [
 
     socket.join(roomCode);
 
+    // Room created: send roomCode, players array and host id
     socket.emit("room-created", {
       roomCode,
       players: Object.values(rooms[roomCode].players),
       host: rooms[roomCode].host
     });
 
+    // emit initial player list to room (including host id)
     io.to(roomCode).emit("player-update", {
       players: Object.values(rooms[roomCode].players),
       host: rooms[roomCode].host
     });
 
+    // send initial scores so host/clients see the scoreboard
     emitScores(roomCode);
   });
 
@@ -139,11 +160,13 @@ const FALLBACK_QUESTIONS = [
 
     socket.join(roomCode);
 
+    // send updated players + host id to everyone
     io.to(roomCode).emit("player-update", {
       players: Object.values(room.players),
       host: room.host
     });
 
+    // update scores for everyone
     emitScores(roomCode);
   });
 
@@ -161,69 +184,145 @@ const FALLBACK_QUESTIONS = [
     startRound(roomCode);
   });
 
-async function startRound(roomCode) {
-  const room = rooms[roomCode];
-  if (!room) return;
+  async function startRound(roomCode) {
+    const room = rooms[roomCode];
+    if (!room) return;
 
-  room.phase = "answer";
-  room.voteStarted = false;
-  room.answers = [];
-  room.submitted.clear();
-  room.votes = {};
+    room.phase = "answer";
+    room.voteStarted = false;
+    room.answers = [];
+    room.submitted.clear();
+    room.votes = {}; // reset votes for this round
 
-  let questionText =
-    FALLBACK_QUESTIONS[Math.floor(Math.random() * FALLBACK_QUESTIONS.length)];
+    let questionText = "Say something funny 😄";
 
-  if (db) {
-    try {
-      console.log("📡 Fetching questions from Firestore...");
-      const snap = await db.collection("questions")
-        .where("active", "==", true)
-        .get();
-
-      const valid = snap.docs
-        .map(d => d.data())
-        .filter(q => typeof q.text === "string" && q.text.trim().length > 0);
-
-      console.log(`📄 Firestore returned ${valid.length} valid questions`);
-
-      if (valid.length > 0) {
-        const q = valid[Math.floor(Math.random() * valid.length)];
-
-        const names = Object.values(room.players).map(p => p.name);
-        const randomName = names.length
-          ? names[Math.floor(Math.random() * names.length)]
-          : "friend";
-
-        if (q.text.includes("{{name}}")) {
+    if (db) {
+      try {
+        const snap = await db.collection("questions").get();
+        const valid = snap.docs.map(d => d.data()).filter(q => q?.text);
+        if (valid.length) {
+          const q = valid[Math.floor(Math.random() * valid.length)];
+          const names = Object.values(room.players).map(p => p.name);
+          const randomName = names[Math.floor(Math.random() * names.length)];
           questionText = q.text.replace(/\{\{name\}\}/gi, randomName);
-        } else {
-          questionText = `About ${randomName}: ${q.text}`;
         }
-
-        console.log("✅ Selected Firestore question:", questionText);
-      } else {
-        console.log("⚠ No valid Firestore questions. Using fallback.");
+      } catch (e) {
+        console.warn("⚠ Error fetching questions from Firestore:", e.message);
+        if (e.message && e.message.includes("Unable to detect a Project Id")) {
+          console.warn("→ Firestore error: Project ID not detected. Set FIREBASE_PROJECT_ID or provide proper service account.");
+        }
       }
-    } catch (e) {
-      console.warn("⚠ Firestore error:", e.message);
     }
+
+    io.to(roomCode).emit("new-question", { text: questionText });
+
+    // Emit current scores immediately so clients can display live scoreboard
+    emitScores(roomCode);
+
+    clearTimeout(room.timer);
+    room.timer = setTimeout(() => forceVote(roomCode), 60000);
   }
 
-  io.to(roomCode).emit("new-question", { text: questionText });
-  emitScores(roomCode);
+  socket.on("submit-answer", ({ roomCode, answer }) => {
+    const room = rooms[roomCode];
+    if (!room || room.phase !== "answer") return;
+    if (room.submitted.has(socket.id)) return;
 
-  clearTimeout(room.timer);
-  room.timer = setTimeout(() => forceVote(roomCode), 60000);
-}
+    room.submitted.add(socket.id);
+    room.answers.push({ author: socket.id, text: answer || "🤡" });
 
+    io.to(roomCode).emit("submission-update", {
+      submitted: room.submitted.size,
+      total: Object.keys(room.players).length
+    });
 
+    if (room.submitted.size === Object.keys(room.players).length) {
+      forceVote(roomCode);
+    }
+  });
+
+  function forceVote(roomCode) {
+    const room = rooms[roomCode];
+    if (!room || room.voteStarted) return;
+
+    room.voteStarted = true;
+    room.phase = "vote";
+    clearTimeout(room.timer);
+
+    console.log("🗳 Entering vote phase", roomCode);
+
+    room.votes = {};
+
+    io.to(roomCode).emit("phase-vote", room.answers);
+    emitScores(roomCode);
+  }
+
+  socket.on("vote", ({ roomCode, votedFor }) => {
+    const room = rooms[roomCode];
+    if (!room || room.phase !== "vote") return;
+    if (room.votes[socket.id]) return;
+    if (votedFor === socket.id) return;
+
+    room.votes[socket.id] = votedFor;
+    if (room.scores[votedFor] !== undefined) {
+      room.scores[votedFor]++;
+    }
+    emitScores(roomCode);
+
+    const totalPlayers = Object.keys(room.players).length;
+    const votesCount = Object.keys(room.votes).length;
+
+    if (votesCount >= totalPlayers) {
+      room.round++;
+      if (room.round >= room.maxRounds) {
+        setTimeout(() => endGame(roomCode), 2000);
+      } else {
+        setTimeout(() => startRound(roomCode), 2000);
+      }
+    }
+  });
+
+  function endGame(roomCode) {
+    const room = rooms[roomCode];
+    if (!room) return;
+    const scores = {};
+    Object.keys(room.players).forEach(id => {
+      const displayName = room.players[id].name;
+      scores[displayName] = room.scores[id];
+    });
+    io.to(roomCode).emit("game-over", scores);
+  }
+
+  socket.on("disconnect", () => {
+    Object.keys(rooms).forEach(rc => {
+      const room = rooms[rc];
+      if (room.players[socket.id]) {
+        delete room.players[socket.id];
+        delete room.scores[socket.id];
+        if (room.host === socket.id) {
+          const remaining = Object.keys(room.players);
+          room.host = remaining.length ? remaining[0] : null;
+        }
+        io.to(rc).emit("player-update", {
+          players: Object.values(room.players),
+          host: room.host
+        });
+        emitScores(rc);
+      }
+    });
+    console.log("🔌 client disconnected", socket.id);
+  });
+});
 // ---------- ADMIN ROUTES ----------
+
 app.get("/admin/questions", adminAuth, async (req, res) => {
   try {
     if (!db) return res.status(503).json({ error: "Database not initialized" });
     const snap = await db.collection("questions").orderBy("createdAt", "desc").get();
-    const questions = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const questions = snap.docs.map(d => ({
+      id: d.id,
+      ...d.data()
+    }));
     res.json(questions);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -239,8 +338,7 @@ app.post("/admin/questions", adminAuth, async (req, res) => {
     const doc = await db.collection("questions").add({
       text,
       active: true,
-     createdAt: Date.now()
-
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     res.json({ success: true, id: doc.id });
@@ -254,29 +352,6 @@ app.delete("/admin/questions/:id", adminAuth, async (req, res) => {
     if (!db) return res.status(503).json({ error: "Database not initialized" });
     await db.collection("questions").doc(req.params.id).delete();
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Protected debug route to inspect what server sees (admin key required)
-app.get("/_debug/questions", adminAuth, async (req, res) => {
-  try {
-    if (!db) return res.status(503).json({ error: "DB not ready" });
-
-    const snap = await db.collection("questions")
-      .where("active", "==", true)
-      .get();
-
-    const valid = snap.docs
-      .map(d => ({ id: d.id, ...d.data() }))
-      .filter(q => typeof q.text === "string" && q.text.trim().length > 0);
-
-    res.json({
-      total: snap.size,
-      validCount: valid.length,
-      questions: valid
-    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
